@@ -3,6 +3,8 @@
 #include <Eigen/Dense>
 #include <vector>
 #include <memory>
+#include <limits>
+#include <deque>
 
 namespace gauss_mapping {
 
@@ -29,7 +31,19 @@ struct Gaussian {
     Mat3 R_map; // AKF: Adaptive Measurement Noise Covariance
     int count = 0;
 
-    Gaussian(const PointCov& pt) : mean(pt.pos), cov(pt.cov), R_map(pt.cov), count(1) {}
+    Gaussian(): mean(Point::Zero()),
+                cov(Mat3::Zero()),
+                R_map(Mat3::Zero()),
+                count(0) { }
+    Gaussian(const PointCov& pt) { init(pt); }
+
+    void init(const PointCov& pt)
+    {
+        mean = pt.pos;
+        cov = pt.cov;
+        R_map = pt.cov;
+        count = 1;
+    }
 
     bool checkFit(const Point& p_pos, const Mat3& p_cov, const Scalar& threshold) const {
         Point diff = p_pos - mean;
@@ -39,7 +53,7 @@ struct Gaussian {
         Mat3 S = getCovariance() + R_map + p_cov; 
         
         Scalar mahalanobis_dist = diff.transpose() * S.ldlt().solve(diff);
-        
+
         return mahalanobis_dist < threshold;
     }
     
@@ -138,33 +152,39 @@ struct Gaussian {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
 };
 
-using GaussianVector = std::vector<Gaussian, Eigen::aligned_allocator<Gaussian>>;
-
 struct Octant {
+
     Point centroid;
     Scalar extent;
-    GaussianVector gaussians;
-    std::unique_ptr<Octant[]> children; // Contiguous memory for 8 children
 
-    Octant(const Point& c, Scalar e) : centroid(c), extent(e), children(nullptr) { }
+    std::vector<Gaussian*> gaussians;
 
-    bool isLeaf() const { return children == nullptr; }
+    Octant **children;
 
-    void init_children() {
-        children = std::unique_ptr<Octant[]>(new Octant[8]{
-            {centroid, extent}, {centroid, extent}, {centroid, extent}, {centroid, extent},
-            {centroid, extent}, {centroid, extent}, {centroid, extent}, {centroid, extent}
-        });
+    Octant() : centroid(Point::Zero()), extent(0.0), children(nullptr) { }
 
-        for (int i = 0; i < 8; ++i) {
-            children[i].extent = extent * 0.5;
-            children[i].centroid(0) += ((i & 1) ? 0.5 : -0.5) * extent;
-            children[i].centroid(1) += ((i & 2) ? 0.5 : -0.5) * extent;
-            children[i].centroid(2) += ((i & 4) ? 0.5 : -0.5) * extent;
+    ~Octant() {
+        if (!isLeaf()) {
+            for (int i = 0; i < 8; ++i) {
+                if (children[i] != nullptr)
+                delete children[i];
+            }
+
+            delete[] children;
+            children = nullptr;
         }
+        gaussians.clear();
     }
-    
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
+
+    bool isLeaf() const
+    {
+        return children == nullptr;
+    }
+
+    void init_children()
+    {
+        children = new Octant*[8]();
+    }
 };
 
 struct Neighbor {
@@ -197,6 +217,65 @@ public:
 private:
     size_t k_;
     std::vector<Neighbor> data_;
+};
+
+template <typename T>
+class Pool {
+public:
+    Pool() = default;
+
+    // Allocate a new object from the pool
+    T* allocate() 
+    {
+        if (!free_list_.empty()) 
+        {
+            T* obj = free_list_.back();
+            free_list_.pop_back();
+
+            *obj = T(); // reset contents
+            return obj;
+        }
+
+        storage_.emplace_back();
+        return &storage_.back();
+    }
+
+    // Free an object back into the pool
+    void free(T* obj) {
+        free_list_.push_back(obj);
+    }
+
+    // Clear entire pool
+    void clear() {
+        storage_.clear();
+        free_list_.clear();
+    }
+
+    // Number of allocated objects (excluding free ones)
+    size_t size() const {
+        return storage_.size() - free_list_.size();
+    }
+
+    // Retrieve active objects
+    std::vector<T*> getActive()
+    {
+        std::vector<T*> result;
+        result.reserve(size());
+
+        for (auto& obj : storage_)
+        {
+            T* ptr = &obj;
+
+            if (std::find(free_list_.begin(), free_list_.end(), ptr) == free_list_.end())
+                result.push_back(ptr);
+        }
+
+        return result;
+    }
+
+private:
+    std::deque<T> storage_;        // stable memory (no realloc)
+    std::vector<T*> free_list_;    // reusable objects
 };
 
 } // namespace gauss_mapping

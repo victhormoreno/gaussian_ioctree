@@ -1,283 +1,537 @@
 #pragma once
 
 #include "gaussian_octree/gauss_common.hpp"
-#include <queue>
 
 namespace gauss_mapping {
 
-// Morton-order based neighbor lookup table for optimized traversal
-static const int ordered_indices[8][7] = {
-    {1, 2, 4, 3, 5, 6, 7}, {0, 3, 5, 2, 4, 7, 6}, {3, 0, 6, 1, 7, 4, 5}, {2, 1, 7, 0, 6, 5, 4},
-    {5, 6, 0, 7, 1, 2, 3}, {4, 7, 1, 6, 0, 3, 2}, {7, 4, 2, 5, 3, 0, 1}, {6, 5, 3, 4, 2, 1, 0}
-};
-
 class Octree {
+
 public:
-    Octree(const Point& center, Scalar extent, size_t max_g = 5, Scalar min_e = 0.1, Scalar chi_threshold = 11.345)
-        : num_points_(0), max_gaussians_(max_g), min_extent_(min_e), chi_threshold_(chi_threshold) {
-        root_ = std::make_unique<Octant>(center, extent);
+
+    Octree(size_t max_g = 5,
+           Scalar min_e = 0.1,
+           Scalar chi = 11.345 )
+        : max_gaussians_leaf_(max_g),
+          min_extent_(min_e),
+          chi_threshold_(chi)
+    { }
+
+private:
+
+    /*
+    ========================================
+    MEMORY POOLS
+    ========================================
+    */
+
+    Pool<Octant> octant_pool_;
+    Pool<Gaussian> gaussian_pool_;
+
+    Octant* allocOctant()
+    {
+        return octant_pool_.allocate();
     }
 
-    void update(const VecPointCov& points, const Mat3& P_curr) {
-        updateRecursive(root_.get(), points, P_curr);
+    Gaussian* allocGaussian(const PointCov& pt)
+    {
+        Gaussian* g = gaussian_pool_.allocate();
+        g->init(pt);
+        return g;
     }
 
-    size_t size() { return num_points_; }
+    /*
+    ========================================
+    TREE STATE
+    ========================================
+    */
 
-    void radiusSearch(Octant* node, const Point& q, Scalar r2, GaussianVector& results) const {
-        if (node->isLeaf()) {
-            for (const auto& g : node->gaussians) {
-                if ((g.mean - q).squaredNorm() < r2) results.push_back(g);
-            }
-        } else {
-            for (int i = 0; i < 8; ++i) {
-                if (boxOverlap(node->children[i], q, r2))
-                    radiusSearch(&node->children[i], q, r2, results);
-            }
+    Octant* root_ = nullptr;
+
+    size_t num_points_ = 0;
+    size_t max_gaussians_leaf_;
+
+    Scalar min_extent_;
+    Scalar chi_threshold_;
+
+public:
+
+    void clear()
+    {
+        if(root_)
+            freeSubtree(root_);
+
+        root_ = nullptr;
+
+        octant_pool_.clear();
+        gaussian_pool_.clear();
+
+        num_points_ = 0;
+    }
+
+    size_t size() const { return gaussian_pool_.size(); }
+    size_t num_points() const { return num_points_; }
+    size_t num_octants() const { return octant_pool_.size(); }
+
+    /*
+    ========================================
+    UPDATE ENTRY
+    ========================================
+    */
+
+    void update(const VecPointCov& pts, const Mat3& P_curr)
+    {
+        if(pts.empty()) return;
+
+        Point min = Point::Constant(std::numeric_limits<Scalar>::max());
+        Point max = Point::Constant(std::numeric_limits<Scalar>::lowest());
+
+        for(const auto& p:pts)
+        {
+            min = min.cwiseMin(p.pos);
+            max = max.cwiseMax(p.pos);
+        }
+
+        if(!root_)
+        {
+            initialize(pts, min, max);
+            return;
+        }
+
+        expandTree(max);
+        expandTree(min);
+
+        updateOctant(root_, pts, P_curr);
+    }
+
+    // k-Nearest Neighbors
+    void knnSearch(const Point& query, int k,
+                   std::vector<Gaussian*>& neighbors,
+                   std::vector<Scalar>& distances) const
+    {
+        if(!root_) return;
+
+        NeighborHeap heap(k);
+        knnRecursive(root_, query, heap);
+
+        neighbors.clear();
+        distances.clear();
+        for(const auto& n : heap.data())
+        {
+            neighbors.push_back(const_cast<Gaussian*>(&n.g)); // return pointer
+            distances.push_back(std::sqrt(n.dist_sq));
         }
     }
 
-    template <typename PointT>
-    void knnSearch(const PointT& query, int k, std::vector<PointT> &neighbors, std::vector<float> &distances) const {
-        NeighborHeap heap(k);
-        Point q = Point(query.x, query.y, query.z);
-        knnSearch(q, heap);
+    // Radius search
+    void radiusSearch(const Point& query,
+                      Scalar radius,
+                      std::vector<Gaussian*>& neighbors,
+                      std::vector<Scalar>& distances) const
+    {
+        if(!root_) return;
 
-        std::vector<Neighbor> points = heap.data();
-        neighbors.reserve(points.size());
-        distances.reserve(points.size());
+        neighbors.clear();
+        distances.clear();
 
-        for(auto& p : points){
-            PointT pt;
-            pt.x = p.g.mean.x();
-            pt.y = p.g.mean.y();
-            pt.z = p.g.mean.z();
-            pt.intensity = p.g.R_map.sum();
-            neighbors.push_back(pt);
-            distances.push_back(std::sqrt(p.dist_sq));
-        }
-
+        radiusRecursive(root_, query, radius*radius, neighbors, distances);
     }
 
-    template <typename PointT>
-    NeighborHeap knnSearch(const PointT& query, int k) const {
-        NeighborHeap heap(k);
-        Point q = Point(query.x, query.y, query.z);
-        knnSearch(q, heap);
-        return heap;
+    std::vector<Gaussian*> getGaussians()
+    {
+        return gaussian_pool_.getActive();
     }
 
-    void knnSearch(const Point& q, NeighborHeap& heap) const {
-        if (!root_) return;
-        knnRecursive(root_.get(), q, heap);
-    }
-
-    GaussianVector getGaussians() {
-        GaussianVector gauss;
-        getAllGaussians(root_.get(), gauss);
-
-        return gauss;
+    std::vector<Octant*> getOctants()
+    {
+        return octant_pool_.getActive();
     }
 
     template <typename PointT, typename ContainerT>
     ContainerT getData() {
-        GaussianVector points;
-        getAllGaussians(root_.get(), points);
+        auto gauss = getGaussians();
 
         ContainerT out;
-        out.reserve(points.size());
+        out.reserve(gauss.size());
 
-        for (const auto& p : points) {
+        for (auto* g : gauss) {
             PointT pt;
-            pt.x = p.mean.x();
-            pt.y = p.mean.y();
-            pt.z = p.mean.z();
-            pt.intensity = p.R_map.trace();
+            pt.x = g->mean.x();
+            pt.y = g->mean.y();
+            pt.z = g->mean.z();
+            pt.intensity = g->R_map.trace();
             out.push_back(pt);
         }
 
         return out;
     }
 
-protected:
-    std::unique_ptr<Octant> root_;
-    size_t num_points_;    // number of points in the tree
-    size_t max_gaussians_; // maximum number of points allowed in an octant before it gets subdivided
-    Scalar min_extent_;    // minimum extent of the octant (used to stop subdividing)
-    Scalar chi_threshold_; // Mahalanobis distance threshold for fitting points to Gaussians
+private:
 
-    void updateRecursive(Octant* octant, const VecPointCov& points, const Mat3& P_curr) {
-        if (octant->isLeaf()) {
-            // Add points to existing Gaussians or create new ones
-            for (const auto& pt : points) {
+    /*
+    ========================================
+    INITIALIZATION
+    ========================================
+    */
+
+    void initialize(const VecPointCov& pts, const Point& min, const Point& max)
+    {
+        clear();
+
+        Point extent = 0.5 * (max - min);
+        Point center = min + extent;
+
+        root_ = createOctant(center, extent.maxCoeff(), pts);
+    }
+
+    /*
+    ========================================
+    OCTANT CREATION
+    ========================================
+    */
+
+    Octant* createOctant(const Point& centroid,
+                         Scalar extent,
+                         const VecPointCov& points)
+    {
+        Octant* oct = allocOctant();
+
+        oct->centroid = centroid;
+        oct->extent = extent;
+
+        if(points.size() > max_gaussians_leaf_
+           && extent > 2*min_extent_)
+        {
+            oct->init_children();
+
+            std::vector<VecPointCov> child_pts(8);
+
+            for(const auto& p:points)
+                child_pts[getIdx(p.pos,centroid)].push_back(p);
+
+            for(int i=0;i<8;i++)
+            {
+                if(child_pts[i].empty()) continue;
+
+                Point c = computeChildCenter(centroid, extent, i);
+
+                oct->children[i] =
+                    createOctant(c, 0.5*extent, child_pts[i]);
+            }
+        }
+        else
+        {
+            for(const auto& p:points)
+            {
+                oct->gaussians.push_back(allocGaussian(p));
+                num_points_++;
+            }
+        }
+
+        return oct;
+    }
+
+    /*
+    ========================================
+    ROOT EXPANSION
+    ========================================
+    */
+
+    void expandTree(const Point& boundary)
+    {
+        static const Scalar factor[] = {-0.5,0.5};
+
+        while((boundary-root_->centroid).cwiseAbs().maxCoeff()
+              > root_->extent)
+        {
+            Scalar parent_extent = 2*root_->extent;
+
+            Point parent_centroid(
+                root_->centroid.x()+factor[boundary.x()>root_->centroid.x()]*parent_extent,
+                root_->centroid.y()+factor[boundary.y()>root_->centroid.y()]*parent_extent,
+                root_->centroid.z()+factor[boundary.z()>root_->centroid.z()]*parent_extent
+            );
+
+            Octant* parent = allocOctant();
+
+            parent->centroid = parent_centroid;
+            parent->extent = parent_extent;
+            parent->init_children();
+
+            parent->children[getIdx(root_->centroid, parent_centroid)] = root_;
+
+            root_ = parent;
+        }
+    }
+
+    /*
+    ========================================
+    OCTANT UPDATE
+    ========================================
+    */
+
+    void updateOctant(Octant*& oct,
+                      const VecPointCov& points,
+                      const Mat3& P_curr)
+    {
+        if(oct->isLeaf())
+        {
+            for(const auto& pt:points)
+            {
                 bool fused = false;
 
-                // Check fit with existing Gaussians
-                for (auto& g : octant->gaussians) {
-                    if (g.checkFit(pt.pos, pt.cov, chi_threshold_)) {
-                        g.fuseAdaptive(pt, P_curr);
+                for(auto* g : oct->gaussians)
+                {
+                    if(g->checkFit(pt.pos, pt.cov, chi_threshold_))
+                    {
+                        g->fuseAdaptive(pt, P_curr);
                         fused = true;
                         break;
                     }
                 }
 
-                // If no fusion, create new Gaussian
-                if (!fused) {
-                    octant->gaussians.emplace_back(pt);
+                if(!fused)
+                {
+                    oct->gaussians.push_back(allocGaussian(pt));
                     num_points_++;
                 }
             }
 
-            // Merge overlapping Gaussians after the whole batch is in
-            mergeGaussiansInOctant(octant);
+            mergeGaussians(oct);
 
-            // Split if necessary
-            if (octant->gaussians.size() > max_gaussians_ && octant->extent > min_extent_) {
-                split(octant);
-            }
-        } else {
-            // Internal Node logic: Batch distribute points to children
-            std::vector<VecPointCov> child_buckets(8);
-            for (const auto& pt : points) {
-                child_buckets[getIdx(pt.pos, octant->centroid)].push_back(pt);
+            if(oct->gaussians.size() > max_gaussians_leaf_
+               && oct->extent > 2*min_extent_)
+            {
+                split(oct);
             }
 
-            #pragma omp parallel for
-            for (int i = 0; i < 8; ++i) {
-                if (child_buckets[i].empty()) continue;
-
-                #pragma omp critical
-                {
-                    if (!octant->children) octant->init_children(); // Ensure child exists
-                }
-
-                updateRecursive(&octant->children[i], child_buckets[i], P_curr);
-            }
+            return;
         }
-    }
 
-    void split(Octant* octant) {
-        octant->init_children();
-        
-        auto old_gaussians = std::move(octant->gaussians);
-        octant->gaussians.clear();
+        std::vector<VecPointCov> child_pts(8);
 
-        for (auto& g : old_gaussians) {
-            // Re-wrap Gaussian into PointCov to re-insert
-                // Note: We don't want to re-fuse and change R_map, just re-locate
-            int idx = getIdx(g.mean, octant->centroid);
-            octant->children[idx].gaussians.push_back(std::move(g));
-        }
-    }
+        for(const auto& p:points)
+            child_pts[getIdx(p.pos,oct->centroid)].push_back(p);
 
-    void mergeGaussiansInOctant(Octant* octant) {
-        if (octant->gaussians.size() < 2) return;
+        for(int i=0;i<8;i++)
+        {
+            if(child_pts[i].empty()) continue;
 
-        for (size_t i = 0; i < octant->gaussians.size(); ++i) {
-            for (size_t j = i + 1; j < octant->gaussians.size(); ) {
-                // Check if Gaussian J fits inside Gaussian I
-                // We use the combined covariance S = Cov_i + Cov_j
-                if (octant->gaussians[i].checkFit(octant->gaussians[j].mean, 
-                                                    octant->gaussians[j].cov, 
-                                                    chi_threshold_)) 
-                {
-                    // Perform the Weighted Bayesian Merge
-                    octant->gaussians[i].merge(octant->gaussians[j]);
-                    
-                    // Remove the redundant Gaussian J
-                    octant->gaussians.erase(octant->gaussians.begin() + j);
-                } else {
-                    ++j;
-                }
+            if(!oct->children[i])
+            {
+                Point c = computeChildCenter(oct->centroid, oct->extent,i);
+
+                oct->children[i] =
+                    createOctant(c, 0.5*oct->extent, child_pts[i]);
+            }
+            else
+            {
+                updateOctant(oct->children[i], child_pts[i], P_curr);
             }
         }
     }
 
-    static inline int getIdx(const Point& p, const Point& c) {
-        return (p.x() > c.x() ? 1 : 0) | (p.y() > c.y() ? 2 : 0) | (p.z() > c.z() ? 4 : 0);
-    }
+    /*
+    ========================================
+    SPLIT
+    ========================================
+    */
 
-    static bool boxOverlap(const Octant& node, const Point& q, Scalar r2) {
-        Scalar d2 = 0;
-        for(int i=0; i<3; ++i) {
-            Scalar min_b = node.centroid[i] - node.extent, max_b = node.centroid[i] + node.extent;
-            if (q[i] < min_b) d2 += std::pow(min_b - q[i], 2);
-            else if (q[i] > max_b) d2 += std::pow(q[i] - max_b, 2);
-        }
-        return d2 <= r2;
-    }
+    void split(Octant* oct)
+    {
+        oct->init_children();
 
-    bool isQuerySphereInside(Octant* octant, const Point& q, Scalar r2) const {
-        // Distance from query to each face of the octant
-        Point dists = octant->extent - (q - octant->centroid).cwiseAbs().array();
-        
-        // If query is outside or the sphere overlaps a boundary, return false
-        if (dists.x() < 0 || dists.x() * dists.x() < r2) return false;
-        if (dists.y() < 0 || dists.y() * dists.y() < r2) return false;
-        if (dists.z() < 0 || dists.z() * dists.z() < r2) return false;
-        
-        return true;
-    }
+        std::vector<std::vector<Gaussian*>> child_gaussians(8);
 
-    bool knnRecursive(Octant* octant, const Point& q, NeighborHeap& heap) const {
-        if (octant->isLeaf()) {
-            for (const auto& g : octant->gaussians) {
-                Scalar d2 = (q - g.mean).squaredNorm();
-                heap.add(g, d2);
-            }
-            return heap.full() && isQuerySphereInside(octant, q, heap.worstDist());
+        // distribute gaussians to children
+        for(auto* g : oct->gaussians)
+        {
+            int idx = getIdx(g->mean, oct->centroid);
+            child_gaussians[idx].push_back(g);
         }
 
-        // 1. Visit the child containing the query point first
-        int morton = getIdx(q, octant->centroid);
-        if (octant->children[morton].centroid.size() > 0) { // Check if valid
-             if (knnRecursive(&octant->children[morton], q, heap)) return true;
-        }
-
-        // 2. Visit other children in optimized order
-        for (int i = 0; i < 7; ++i) {
-            int c = ordered_indices[morton][i];
-            Octant* child = &octant->children[c];
-
-            // Pruning: skip if child cannot possibly contain a closer point
-            if (heap.full() && !overlaps(child, q, heap.worstDist()))
+        // create children
+        for(int i = 0; i < 8; i++)
+        {
+            if(child_gaussians[i].empty())
                 continue;
 
-            if (knnRecursive(child, q, heap)) return true;
+            Point child_center =
+                computeChildCenter(oct->centroid, oct->extent, i);
+
+            Octant* child = allocOctant();
+
+            child->centroid = child_center;
+            child->extent = 0.5 * oct->extent;
+
+            child->gaussians = std::move(child_gaussians[i]);
+
+            oct->children[i] = child;
         }
 
-        return heap.full() && isQuerySphereInside(octant, q, heap.worstDist());
+        // parent is no longer leaf
+        oct->gaussians.clear();
     }
 
-    static Scalar minDistSq(Octant* node, const Point& q) {
-        Scalar d2 = 0;
-        for(int i=0; i<3; ++i) {
-            Scalar min_b = node->centroid[i] - node->extent, max_b = node->centroid[i] + node->extent;
-            if (q[i] < min_b) d2 += std::pow(min_b - q[i], 2);
-            else if (q[i] > max_b) d2 += std::pow(q[i] - max_b, 2);
-        }
-        return d2;
-    }
+    /*
+    ========================================
+    GAUSSIAN MERGING
+    ========================================
+    */
 
-    static bool overlaps(Octant* node, const Point& q, Scalar r2) {
-        return minDistSq(node, q) <= r2;
-    }
+    void mergeGaussians(Octant*& oct)
+    {
+        // To-Do: sort gaussians to avoid O(n^2)
+        for(size_t i=0; i < oct->gaussians.size(); i++)
+        {
+            for(size_t j=i+1; j < oct->gaussians.size();)
+            {
+                Gaussian* gi = oct->gaussians[i];
+                Gaussian* gj = oct->gaussians[j];
 
-    void getAllGaussians(Octant* node, GaussianVector& out_points) const {
-        if (node == nullptr)
-            return;
-
-        if (node->isLeaf()) {
-            out_points.insert(out_points.end(), node->gaussians.begin(), node->gaussians.end());
-        } else if (node->children) {
-            for (int i = 0; i < 8; ++i) {
-                getAllGaussians(&node->children[i], out_points);
+                if(gi->checkFit(gj->mean, gj->cov, chi_threshold_))
+                {
+                    gi->merge(*gj);
+                    
+                    gaussian_pool_.free(gj); // free the merged Gaussian from pool
+                    oct->gaussians.erase(oct->gaussians.begin()+j); 
+                }
+                else j++;
             }
         }
     }
+
+    /*
+    ========================================
+    SEARCH IMPLEMENTATION
+    ========================================
+    */
+
+    bool knnRecursive(const Octant* oct, const Point& q, NeighborHeap& heap) const
+    {
+        if(!oct) return false;
+
+        if(oct->isLeaf())
+        {
+            for(auto* g : oct->gaussians)
+            {
+                Scalar d2 = (g->mean - q).squaredNorm();
+                heap.add(*g, d2);
+            }
+            return heap.full() && isInsideOctant(oct, q, heap.worstDist());
+        }
+
+        int morton = getIdx(q, oct->centroid);
+        if(knnRecursive(oct->children[morton], q, heap)) return true;
+
+        static const int ordered_indices[8][7] = {
+            {1, 2, 4, 3, 5, 6, 7}, {0, 3, 5, 2, 4, 7, 6}, {0, 3, 6, 1, 4, 7, 5}, {1, 2, 7, 0, 5, 6, 4},
+            {0, 5, 6, 1, 2, 7, 3}, {1, 4, 7, 0, 3, 6, 2}, {2, 4, 7, 0, 3, 5, 1}, {3, 5, 6, 1, 2, 4, 0}
+        };
+
+        for(int i=0;i<7;i++)
+        {
+            int c = ordered_indices[morton][i];
+            if(!oct->children[c]) continue;
+            if(heap.full() && !overlaps(oct->children[c], q, heap.worstDist())) continue;
+            if(knnRecursive(oct->children[c], q, heap)) return true;
+        }
+
+        return heap.full() && isInsideOctant(oct, q, heap.worstDist());
+    }
+
+    void radiusRecursive(const Octant* oct,
+                         const Point& q,
+                         Scalar sqr_radius,
+                         std::vector<Gaussian*>& neighbors,
+                         std::vector<Scalar>& distances) const
+    {
+        if(!oct) return;
+
+        if(oct->isLeaf())
+        {
+            for(auto* g : oct->gaussians)
+            {
+                Scalar d2 = (g->mean - q).squaredNorm();
+                if(d2 <= sqr_radius)
+                {
+                    neighbors.push_back(g);
+                    distances.push_back(std::sqrt(d2));
+                }
+            }
+            return;
+        }
+
+        for(int i=0;i<8;i++)
+        {
+            if(!oct->children[i] || !overlaps(oct->children[i], q, sqr_radius)) continue;
+            radiusRecursive(oct->children[i], q, sqr_radius, neighbors, distances);
+        }
+    }
+
+    /*
+    ========================================
+    UTILS
+    ========================================
+    */
+
+    static int getIdx(const Point& p,const Point& c)
+    {
+        return (p.x() > c.x() ? 1 : 0)
+             | (p.y() > c.y() ? 2 : 0)
+             | (p.z() > c.z() ? 4 : 0);
+    }
+
+    static Point computeChildCenter(const Point& c,
+                                    Scalar extent,
+                                    int idx)
+    {
+        static const Scalar factor[2]={-0.5,0.5};
+
+        return Point(
+            c.x() + factor[(idx & 1) > 0] * extent,
+            c.y() + factor[(idx & 2) > 0] * extent,
+            c.z() + factor[(idx & 4) > 0] * extent
+        );
+    }
+
+    bool overlaps(const Octant* oct, const Point& q, Scalar sqr_radius) const
+    {
+        Point dist = ((q - oct->centroid).cwiseAbs().array() - oct->extent);
     
-    // Friend class to allow IVox to access root_
-    friend class GaussianIVox;
+        if ((dist.x() > 0 and dist.x()*dist.x() > sqr_radius) or
+            (dist.y() > 0 and dist.y()*dist.y() > sqr_radius) or
+            (dist.z() > 0 and dist.z()*dist.z() > sqr_radius))
+        return false;
+
+        int num_less_extent = (dist.x() < 0) + (dist.y() < 0) + (dist.z() < 0);
+
+        if (num_less_extent > 1) return true;
+
+        return (dist.cwiseMax(0.0).squaredNorm() < sqr_radius);
+    }
+
+    bool isInsideOctant(const Octant* oct, const Point& q, Scalar radius) const
+    {
+        Point dist = oct->extent - (q - oct->centroid).cwiseAbs().array();
+    
+        return (dist.x() < 0 or dist.x()*dist.x() < radius) ? false : 
+                (dist.y() < 0 or dist.y()*dist.y() < radius) ? false :
+                (dist.z() < 0 or dist.z()*dist.z() < radius) ? false :
+                true;
+    }
+
+    void freeSubtree(Octant* oct)
+    {
+        if(!oct) return;
+
+        for(int i=0;i<8;i++)
+        {
+            if(oct->children[i])
+                freeSubtree(oct->children[i]);
+        }
+
+        octant_pool_.free(oct);
+    }
 };
 
 } // namespace gauss_mapping

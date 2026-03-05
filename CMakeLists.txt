@@ -22,7 +22,7 @@ find_package(ament_cmake REQUIRED)
 find_package(eigen3_cmake_module REQUIRED)
 find_package(Eigen3 REQUIRED)
 
-# For gaussian_octree_test (PCD loader + ROS2 publisher)
+# For static_load_test (PCD loader + ROS2 publisher)
 find_package(rclcpp REQUIRED)
 find_package(sensor_msgs REQUIRED)
 find_package(visualization_msgs REQUIRED)
@@ -49,9 +49,9 @@ target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_17)
 # -----------------------
 # Test executable: load + publish PCD
 # -----------------------
-add_executable(gaussian_octree_test src/gaussian_octree_test.cpp)
+add_executable(static_load_test src/static_load_test.cpp)
 
-ament_target_dependencies(gaussian_octree_test
+ament_target_dependencies(static_load_test
   rclcpp
   sensor_msgs
   visualization_msgs
@@ -59,23 +59,68 @@ ament_target_dependencies(gaussian_octree_test
   pcl_ros
 )
 
-target_include_directories(gaussian_octree_test PRIVATE
+target_include_directories(static_load_test PRIVATE
   ${PCL_INCLUDE_DIRS}
 )
 
 # Link libraries 
-target_link_libraries(gaussian_octree_test
+target_link_libraries(static_load_test
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+# OpenMP
+if(OpenMP_CXX_FOUND)
+  target_link_libraries(static_load_test OpenMP::OpenMP_CXX)
+  message(STATUS "OpenMP enabled for static_load_test")
+else()
+  message(WARNING "OpenMP not found: omp pragmas will be ignored")
+endif()
+
+# -----------------------
+# Test executable: real time incremental mapping test
+# -----------------------
+add_executable(real_time_test src/real_time_test.cpp)
+
+ament_target_dependencies(real_time_test
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(real_time_test PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(real_time_test
   ${PROJECT_NAME}
   ${PCL_LIBRARIES}
 )
 
-# OpenMP
-if(OpenMP_CXX_FOUND)
-  target_link_libraries(gaussian_octree_test OpenMP::OpenMP_CXX)
-  message(STATUS "OpenMP enabled for gaussian_octree_test")
-else()
-  message(WARNING "OpenMP not found: omp pragmas will be ignored")
-endif()
+# -----------------------
+# Test executable: incremental mapping test
+# -----------------------
+add_executable(incremental_mapping_test src/incremental_mapping_test.cpp)
+
+ament_target_dependencies(incremental_mapping_test
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(incremental_mapping_test PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(incremental_mapping_test
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
 
 # -----------------------
 # Install
@@ -86,7 +131,9 @@ install(DIRECTORY include/
 
 install(TARGETS
   ${PROJECT_NAME}
-  gaussian_octree_test
+  static_load_test
+  real_time_test
+  incremental_mapping_test
   EXPORT export_${PROJECT_NAME}
   DESTINATION lib/${PROJECT_NAME}
 )

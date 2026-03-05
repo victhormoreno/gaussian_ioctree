@@ -32,17 +32,9 @@
 
 using namespace std::chrono_literals;
 
-// Expose protected root_.
-class OctreeAccess : public gauss_mapping::Octree {
+class GaussianOctreeStaticLoad : public rclcpp::Node {
 public:
-  using gauss_mapping::Octree::Octree;
-  gauss_mapping::Octant* root_ptr() { return root_.get(); }
-  const gauss_mapping::Octant* root_ptr() const { return root_.get(); }
-};
-
-class GaussianOctreePCDPublisher : public rclcpp::Node {
-public:
-  GaussianOctreePCDPublisher() : Node("gaussian_octree_test")
+  GaussianOctreeStaticLoad() : Node("gaussian_octree_test")
   {
     // ---- params (only these) ----
     pcd_path_  = this->declare_parameter<std::string>("pcd_path", "");
@@ -112,34 +104,6 @@ private:
     if (!filtered_cloud_ || filtered_cloud_->empty())
       throw std::runtime_error("Filtered cloud is empty");
 
-    // AABB
-    float min_x =  std::numeric_limits<float>::infinity();
-    float min_y =  std::numeric_limits<float>::infinity();
-    float min_z =  std::numeric_limits<float>::infinity();
-    float max_x = -std::numeric_limits<float>::infinity();
-    float max_y = -std::numeric_limits<float>::infinity();
-    float max_z = -std::numeric_limits<float>::infinity();
-
-    size_t finite_count = 0;
-    for (const auto& p : filtered_cloud_->points) {
-      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
-      min_x = std::min(min_x, p.x); min_y = std::min(min_y, p.y); min_z = std::min(min_z, p.z);
-      max_x = std::max(max_x, p.x); max_y = std::max(max_y, p.y); max_z = std::max(max_z, p.z);
-      finite_count++;
-    }
-    if (finite_count == 0) throw std::runtime_error("No finite points");
-
-    gauss_mapping::Point center;
-    center << 0.5 * (min_x + max_x),
-              0.5 * (min_y + max_y),
-              0.5 * (min_z + max_z);
-
-    const float dx = (max_x - min_x);
-    const float dy = (max_y - min_y);
-    const float dz = (max_z - min_z);
-    float half = 0.5f * std::max({dx, dy, dz});
-    half += static_cast<float>(std::max(1e-6, leaf_size_));
-
     // point covariance
     const gauss_mapping::Mat3 p_cov = 0.01 * gauss_mapping::Mat3::Identity();
     const gauss_mapping::Mat3 P_curr = p_cov;
@@ -148,16 +112,14 @@ private:
     const size_t max_g = 5;
     const gauss_mapping::Scalar min_extent = static_cast<gauss_mapping::Scalar>(leaf_size_);
 
-    octree_ = std::make_unique<OctreeAccess>(
-      center,
-      static_cast<gauss_mapping::Scalar>(half),
+    octree_ = std::make_unique<gauss_mapping::Octree>(
       max_g,
       min_extent,
       static_cast<gauss_mapping::Scalar>(chi_)
     );
 
     gauss_mapping::VecPointCov batch;
-    batch.reserve(finite_count);
+    // batch.reserve(finite_count);
     for (const auto& p : filtered_cloud_->points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
       gauss_mapping::Point pos;
@@ -167,14 +129,19 @@ private:
       batch.emplace_back(pos, p_cov);
     }
 
+    auto tick = std::chrono::system_clock::now(); 
     octree_->update(batch, P_curr);
+    auto tack = std::chrono::system_clock::now();
+
+    std::chrono::duration<double> elapsed_time = tack-tick;
+    
     octree_loaded_ = true;
 
     cached_gaussians_.clear();
     cached_gaussians_ = octree_->getGaussians();
 
-    RCLCPP_INFO(get_logger(), "Octree: gaussians=%zu (num_points=%zu)",
-                cached_gaussians_.size(), octree_->size());
+    RCLCPP_INFO(get_logger(), "Octree contains %zu gaussians (num_points=%zu) and took %f ms to load",
+                octree_->size(), octree_->num_points(), elapsed_time.count()*1000.0);
   }
 
   visualization_msgs::msg::MarkerArray make_gaussian_markers(const rclcpp::Time& stamp) const {
@@ -191,13 +158,13 @@ private:
 
     const double k_sigma = 1.0;
     const double alpha   = 0.7;
-    const size_t max_markers = 5000;
+    const size_t max_markers = 50000;
 
     const size_t n = std::min(max_markers, cached_gaussians_.size());
     arr.markers.reserve(n + 1);
 
     for (size_t i = 0; i < n; ++i) {
-      const auto& g = cached_gaussians_[i];
+      const auto& g = *cached_gaussians_[i];
 
       gauss_mapping::Mat3 Sigma = g.getCovariance();
 
@@ -275,8 +242,8 @@ private:
   sensor_msgs::msg::PointCloud2 cloud_msg_;
   pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud_{nullptr};
 
-  std::unique_ptr<OctreeAccess> octree_{nullptr};
-  gauss_mapping::GaussianVector cached_gaussians_;
+  std::unique_ptr<gauss_mapping::Octree> octree_{nullptr};
+  std::vector<gauss_mapping::Gaussian*> cached_gaussians_;
 
   // ros
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
@@ -287,7 +254,7 @@ private:
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   try {
-    auto node = std::make_shared<GaussianOctreePCDPublisher>();
+    auto node = std::make_shared<GaussianOctreeStaticLoad>();
     rclcpp::spin(node);
   } catch (const std::exception& e) {
     RCLCPP_ERROR(rclcpp::get_logger("gaussian_octree_test"), "Exception: %s", e.what());
