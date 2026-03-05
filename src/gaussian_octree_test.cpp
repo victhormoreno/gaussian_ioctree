@@ -36,7 +36,6 @@ using namespace std::chrono_literals;
 class OctreeAccess : public gauss_mapping::Octree {
 public:
   using gauss_mapping::Octree::Octree;
-  using gauss_mapping::Octree::getAllGaussians;
   gauss_mapping::Octant* root_ptr() { return root_.get(); }
   const gauss_mapping::Octant* root_ptr() const { return root_.get(); }
 };
@@ -141,9 +140,8 @@ private:
     float half = 0.5f * std::max({dx, dy, dz});
     half += static_cast<float>(std::max(1e-6, leaf_size_));
 
-    // point covariance ~ leaf_size
-    const gauss_mapping::Scalar sigma = static_cast<gauss_mapping::Scalar>(leaf_size_);
-    const gauss_mapping::Mat3 p_cov = (sigma * sigma) * gauss_mapping::Mat3::Identity();
+    // point covariance
+    const gauss_mapping::Mat3 p_cov = 0.01 * gauss_mapping::Mat3::Identity();
     const gauss_mapping::Mat3 P_curr = p_cov;
 
     // internal constants
@@ -173,7 +171,7 @@ private:
     octree_loaded_ = true;
 
     cached_gaussians_.clear();
-    octree_->getAllGaussians(octree_->root_ptr(), cached_gaussians_);
+    cached_gaussians_ = octree_->getGaussians();
 
     RCLCPP_INFO(get_logger(), "Octree: gaussians=%zu (num_points=%zu)",
                 cached_gaussians_.size(), octree_->size());
@@ -191,7 +189,7 @@ private:
     del.action = visualization_msgs::msg::Marker::DELETEALL;
     arr.markers.push_back(del);
 
-    const double k_sigma = 2.0;
+    const double k_sigma = 1.0;
     const double alpha   = 0.7;
     const size_t max_markers = 5000;
 
@@ -201,8 +199,7 @@ private:
     for (size_t i = 0; i < n; ++i) {
       const auto& g = cached_gaussians_[i];
 
-      gauss_mapping::Mat3 Sigma = g.cov + g.R_map;
-      Sigma = 0.5 * (Sigma + Sigma.transpose().eval());
+      gauss_mapping::Mat3 Sigma = g.getCovariance();
 
       Eigen::SelfAdjointEigenSolver<gauss_mapping::Mat3> es(Sigma);
       if (es.info() != Eigen::Success) continue;
