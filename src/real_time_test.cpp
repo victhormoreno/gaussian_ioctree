@@ -79,6 +79,8 @@ public:
       topic_, rclcpp::QoS(1).transient_local());
     gauss_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
       gaussian_topic_, rclcpp::QoS(1).transient_local());
+    gaussian_cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
+      "/gaussian_cloud", rclcpp::QoS(1).transient_local());
 
     lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
                     lidar_topic_, 1, std::bind(&GaussianOctreeRealTime::lidar_callback, this, std::placeholders::_1));
@@ -132,8 +134,34 @@ private:
 
     cloud_pub_->publish(msg);
 
+    gaussian_cloud_pub_->publish(make_gaussian_cloud(this->now()));
+
     gauss_pub_->publish(make_gaussian_markers(this->now()));
 
+  }
+  
+  sensor_msgs::msg::PointCloud2 make_gaussian_cloud(const rclcpp::Time& stamp) const
+  {
+    pcl::PointCloud<pcl::PointXYZI> cloud;
+    cloud.reserve(cached_gaussians_.size());
+
+    for (const auto* g : cached_gaussians_) {
+      pcl::PointXYZI p;
+      p.x = g->mean.x();
+      p.y = g->mean.y();
+      p.z = g->mean.z();
+      p.intensity = std::sqrt(g->getCovariance().trace()); // geometric covariance
+      // p.intensity = g->count; // points count
+      cloud.push_back(p);
+    }
+
+    sensor_msgs::msg::PointCloud2 msg;
+    pcl::toROSMsg(cloud, msg);
+
+    msg.header.frame_id = frame_id_;
+    msg.header.stamp = stamp;
+
+    return msg;
   }
 
   visualization_msgs::msg::MarkerArray make_gaussian_markers(const rclcpp::Time& stamp) const {
@@ -149,15 +177,15 @@ private:
 
     const double k_sigma = 1.0;
     const double alpha   = 0.7;
-    const size_t max_markers = 50000;
+    const size_t max_markers = 5000;
 
     const size_t n = std::min(max_markers, cached_gaussians_.size());
     arr.markers.reserve(n + 1);
 
     for (size_t i = 0; i < n; ++i) {
-      const auto& g = *cached_gaussians_[i];
+      const auto& g = *cached_gaussians_[n-1-i];
 
-      gauss_mapping::Mat3 Sigma = g.getCovariance();
+      gauss_mapping::Mat3 Sigma = g.cov; // not normalized covariance
 
       Eigen::SelfAdjointEigenSolver<gauss_mapping::Mat3> es(Sigma);
       if (es.info() != Eigen::Success) continue;
@@ -193,9 +221,13 @@ private:
       m.scale.y = 2.0 * k_sigma * std::sqrt(evals(1));
       m.scale.z = 2.0 * k_sigma * std::sqrt(evals(2));
 
-      m.color.r = 0.2f;
-      m.color.g = 0.9f;
-      m.color.b = 0.9f;
+      // Example: color by count (or any Gaussian property)
+      float k = 10.0f; // controls saturation speed -> k points is half the colormap value
+      float v = float(g.count) / (float(g.count) + k);
+      m.color.r = v;
+      m.color.g = 1.0f - std::fabs(v - 0.5f) * 2.0f;
+      m.color.b = 1.0f - v;
+
       m.color.a = static_cast<float>(alpha);
 
       m.lifetime = rclcpp::Duration(0, 0);
@@ -223,6 +255,7 @@ private:
 
   // ros
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
+  rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr gaussian_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gauss_pub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
 };
@@ -235,6 +268,7 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     RCLCPP_ERROR(rclcpp::get_logger("gaussian_octree_test"), "Exception: %s", e.what());
   }
+
   rclcpp::shutdown();
   return 0;
 }

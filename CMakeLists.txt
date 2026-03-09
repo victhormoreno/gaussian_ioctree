@@ -6,7 +6,7 @@ if(POLICY CMP0074)
   cmake_policy(SET CMP0074 NEW)
 endif()
 
-# Default to Release if not specified )
+# Default to Release if not specified 
 if(NOT CMAKE_CONFIGURATION_TYPES AND NOT CMAKE_BUILD_TYPE)
   set(CMAKE_BUILD_TYPE Release CACHE STRING "Build type" FORCE)
 endif()
@@ -14,6 +14,8 @@ endif()
 if(CMAKE_COMPILER_IS_GNUCXX OR CMAKE_CXX_COMPILER_ID MATCHES "Clang")
   add_compile_options(-Wall -Wextra -Wpedantic)
 endif()
+
+option(ENABLE_PROFILING "Enable debug RAII profiling" OFF)
 
 # -----------------------
 # Dependencies
@@ -45,6 +47,10 @@ target_include_directories(${PROJECT_NAME} INTERFACE
 
 target_link_libraries(${PROJECT_NAME} INTERFACE Eigen3::Eigen)
 target_compile_features(${PROJECT_NAME} INTERFACE cxx_std_17)
+
+if(ENABLE_PROFILING)
+target_compile_definitions(${PROJECT_NAME} INTERFACE ENABLE_PROFILING)
+endif()
 
 # -----------------------
 # Test executable: load + publish PCD

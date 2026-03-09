@@ -224,9 +224,12 @@ private:
       m.scale.z = 2.0 * k_sigma * std::sqrt(evals(2));
 
       // Example: color by count (or any Gaussian property)
-      m.color.r = std::min(255.0f, float(g.count) * 10.0f); // scale count to 0-255
-      m.color.g = 0;
-      m.color.b = 255 - m.color.r;
+      float k = 10.0f; // controls saturation speed -> k points is half the colormap value
+      float v = float(g.count) / (float(g.count) + k);
+      m.color.r = v;
+      m.color.g = 1.0f - std::fabs(v - 0.5f) * 2.0f;
+      m.color.b = 1.0f - v;
+
       m.color.a = static_cast<float>(alpha);
 
       m.lifetime = rclcpp::Duration(1.0, 0);
@@ -292,6 +295,7 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     RCLCPP_ERROR(rclcpp::get_logger("gaussian_octree_test"), "Exception: %s", e.what());
   }
+
   rclcpp::shutdown();
   return 0;
 }

@@ -259,6 +259,7 @@ int main(int argc, char** argv) {
   } catch (const std::exception& e) {
     RCLCPP_ERROR(rclcpp::get_logger("gaussian_octree_test"), "Exception: %s", e.what());
   }
+
   rclcpp::shutdown();
   return 0;
 }
