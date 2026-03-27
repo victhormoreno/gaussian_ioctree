@@ -1,4 +1,4 @@
-// real_time_test.cpp
+// real_time_test_ivox.cpp
 //
 // Publishes at 1 Hz:
 //  - Filtered PCD cloud on /pcd
@@ -6,7 +6,7 @@
 //
 // Params:
 //  - lidar_topic (string)
-//  - leaf_size (double)
+//  - res (double)
 //  - chi (double)
 
 #include <chrono>
@@ -29,7 +29,7 @@
 #include <pcl/pcl_config.h>
 
 #include <Eigen/Dense>
-#include "gaussian_octree/gauss_octree.hpp"
+#include "gaussian_octree/gauss_ivox.hpp"
 
 struct PointType {
     PointType(): data{0.f, 0.f, 0.f, 1.f} {}
@@ -58,13 +58,13 @@ POINT_CLOUD_REGISTER_POINT_STRUCT(PointType,
 
 using namespace std::chrono_literals;
 
-class GaussianOctreeRealTime : public rclcpp::Node {
+class GaussianIVoxRealTime : public rclcpp::Node {
 public:
-  GaussianOctreeRealTime() : Node("gaussian_octree_test")
+  GaussianIVoxRealTime() : Node("gaussian_ivox_test")
   {
     // ---- params (only these) ----
     lidar_topic_  = this->declare_parameter<std::string>("lidar_topic", "/lidar_points");
-    leaf_size_ = this->declare_parameter<double>("leaf_size", 1.0);
+    resolution_ = this->declare_parameter<double>("res", 5.0);
     chi_       = this->declare_parameter<double>("chi", 7.815);
 
     // fixed topics/frames
@@ -72,7 +72,7 @@ public:
     topic_    = "/pcd";
     gaussian_topic_ = "/gaussians";
 
-    if (leaf_size_ <= 0.0) leaf_size_ = 1e-6;
+    if (resolution_ <= 0.0) resolution_ = 0.001;
     if (chi_ <= 0.0) chi_ = 1e-6;
 
     cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
@@ -83,21 +83,23 @@ public:
       "/gaussian_cloud", rclcpp::QoS(1).transient_local());
 
     lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                    lidar_topic_, 1, std::bind(&GaussianOctreeRealTime::lidar_callback, this, std::placeholders::_1));
+                    lidar_topic_, 1, std::bind(&GaussianIVoxRealTime::lidar_callback, this, std::placeholders::_1));
 
-    // Declare Octree
+    // Publish periodically (1 Hz)
+    // timer_ = this->create_wall_timer(1s, [this]() { publish_once(); });
+
+    // Declare Incremental Voxel
     const size_t max_g = 5;
-    const gauss_mapping::Scalar min_extent = static_cast<gauss_mapping::Scalar>(leaf_size_);
 
-    octree_ = std::make_unique<gauss_mapping::Octree>(
+    ivox_ = std::make_unique<gauss_mapping::GaussianIVox>(
+      resolution_,
       max_g,
-      min_extent,
       static_cast<gauss_mapping::Scalar>(chi_)
     );
 
     RCLCPP_INFO(get_logger(),
-                "Ready: topic='%s' leaf_size=%.6f chi=%.3f",
-                lidar_topic_.c_str(), leaf_size_, chi_);
+                "Ready: topic='%s' chi=%.3f res=%.3f",
+                lidar_topic_.c_str(), chi_, resolution_);
   }
 
 private:
@@ -121,24 +123,37 @@ private:
     }
 
     auto tick = std::chrono::system_clock::now(); 
-    octree_->update(batch, P_curr);
+    ivox_->update(batch, P_curr);
     auto tack = std::chrono::system_clock::now();
 
     std::chrono::duration<double> elapsed_time = tack-tick;
 
-    RCLCPP_INFO(get_logger(), "Octree contains %zu gaussians (num_points=%zu) and took %f ms to update",
-                octree_->size(), octree_->num_points(), elapsed_time.count()*1000.0);
+    RCLCPP_INFO(get_logger(), "Ivox contains %zu gaussians (%zu points) and took %f ms to update",
+                ivox_->size(), ivox_->num_points(), elapsed_time.count()*1000.0);
 
-    cached_gaussians_.clear();
-    cached_gaussians_ = octree_->getGaussians();
+    // cloud_pub_->publish(msg);
 
-    cloud_pub_->publish(msg);
+    // cached_gaussians_.clear();
+    // cached_gaussians_ = ivox_->getGaussians();
 
-    gaussian_cloud_pub_->publish(make_gaussian_cloud(this->now()));
+    // gaussian_cloud_pub_->publish(make_gaussian_cloud(this->now()));
 
-    gauss_pub_->publish(make_gaussian_markers(this->now()));
+    // gauss_pub_->publish(make_gaussian_markers(this->now()));
 
   }
+
+  // void publish_once()
+  // {
+  //   if (!(ivox_->size() > 0))
+  //       return;
+
+  //   cached_gaussians_.clear();
+  //   cached_gaussians_ = ivox_->getGaussians();
+
+  //   gaussian_cloud_pub_->publish(make_gaussian_cloud(this->now()));
+
+  //   gauss_pub_->publish(make_gaussian_markers(this->now()));
+  // }
   
   sensor_msgs::msg::PointCloud2 make_gaussian_cloud(const rclcpp::Time& stamp) const
   {
@@ -177,7 +192,7 @@ private:
 
     const double k_sigma = 1.0;
     const double alpha   = 0.7;
-    const size_t max_markers = 10000;
+    const size_t max_markers = 5000;
 
     const size_t n = std::min(max_markers, cached_gaussians_.size());
     arr.markers.reserve(n + 1);
@@ -240,8 +255,8 @@ private:
 private:
   // params
   std::string pcd_path_;
-  double leaf_size_{1.0};
   double chi_{7.815};
+  double resolution_{5.0};
 
   // fixed
   std::string lidar_topic_{""};
@@ -250,7 +265,7 @@ private:
   std::string gaussian_topic_{"/gaussians"};
 
   // map
-  std::unique_ptr<gauss_mapping::Octree> octree_{nullptr};
+  std::unique_ptr<gauss_mapping::GaussianIVox> ivox_{nullptr};
   std::vector<gauss_mapping::Gaussian*> cached_gaussians_;
 
   // ros
@@ -258,15 +273,16 @@ private:
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr gaussian_cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gauss_pub_;
   rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
+  // rclcpp::TimerBase::SharedPtr timer_;
 };
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   try {
-    auto node = std::make_shared<GaussianOctreeRealTime>();
+    auto node = std::make_shared<GaussianIVoxRealTime>();
     rclcpp::spin(node);
   } catch (const std::exception& e) {
-    RCLCPP_ERROR(rclcpp::get_logger("gaussian_octree_test"), "Exception: %s", e.what());
+    RCLCPP_ERROR(rclcpp::get_logger("gaussian_ivox_test"), "Exception: %s", e.what());
   }
 
   rclcpp::shutdown();

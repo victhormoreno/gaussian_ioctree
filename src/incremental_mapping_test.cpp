@@ -1,4 +1,4 @@
-// gaussian_octree_test.cpp
+// incremental_mapping_test.cpp
 //
 // Publishes at 1 Hz:
 //  - Filtered PCD cloud on /pcd

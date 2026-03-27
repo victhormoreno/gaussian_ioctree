@@ -106,6 +106,29 @@ target_link_libraries(real_time_test
 )
 
 # -----------------------
+# Test executable: real time incremental mapping test with ivox
+# -----------------------
+add_executable(real_time_test_ivox src/real_time_test_ivox.cpp)
+
+ament_target_dependencies(real_time_test_ivox
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(real_time_test_ivox PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(real_time_test_ivox
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+
+# -----------------------
 # Test executable: incremental mapping test
 # -----------------------
 add_executable(incremental_mapping_test src/incremental_mapping_test.cpp)
@@ -139,6 +162,7 @@ install(TARGETS
   ${PROJECT_NAME}
   static_load_test
   real_time_test
+  real_time_test_ivox
   incremental_mapping_test
   EXPORT export_${PROJECT_NAME}
   DESTINATION lib/${PROJECT_NAME}

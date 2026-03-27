@@ -1,4 +1,4 @@
-// gaussian_octree_test.cpp
+// static_load_test.cpp
 //
 // Publishes at 1 Hz:
 //  - Filtered PCD cloud on /pcd

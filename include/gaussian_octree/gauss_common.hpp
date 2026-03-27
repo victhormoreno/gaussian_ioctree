@@ -31,11 +31,17 @@ struct Gaussian {
     Mat3 R_map; // AKF: Adaptive Measurement Noise Covariance
     int count = 0;
 
+    // Caching for Eigen-decomposition
+    mutable bool dirty_ = true;
+    mutable Point cached_normal_ = Point::UnitZ();
+    mutable Scalar cached_d_ = 0.0;
+    mutable Eigen::SelfAdjointEigenSolver<Mat3> solver_;
+
     Gaussian(): mean(Point::Zero()),
                 cov(Mat3::Zero()),
                 R_map(Mat3::Zero()),
                 count(0) { }
-    Gaussian(const PointCov& pt) { init(pt); }
+    Gaussian(const PointCov& pt) : Gaussian() { init(pt); }
 
     void init(const PointCov& pt)
     {
@@ -43,6 +49,23 @@ struct Gaussian {
         cov = pt.cov;
         R_map = pt.cov;
         count = 1;
+        dirty_ = true;
+    }
+
+    /**
+     * @brief Updates the cached eigen-values/vectors if the Gaussian has changed.
+     */
+    void updateCache() const {
+        if (!dirty_) return;
+        
+        // Solve for the geometric covariance: cov / count
+        solver_.compute(cov / static_cast<Scalar>(count));
+        
+        // The normal is the eigenvector corresponding to the smallest eigenvalue
+        cached_normal_ = solver_.eigenvectors().col(0);
+        cached_d_ = -cached_normal_.dot(mean);
+        
+        dirty_ = false;
     }
 
     bool checkFit(const Point& p_pos, const Mat3& p_cov, const Scalar& threshold) const {
@@ -69,8 +92,7 @@ struct Gaussian {
         const Scalar R_MAX = 1e-2;   
         Rn = std::clamp(Rn, R_MIN, R_MAX);
 
-        // Mat3 R_obs = Mat3::Identity() * Rn;
-        Mat3 R_obs = Rn * (normal * normal.transpose());
+        Mat3 R_obs = Rn * (normal * normal.transpose()) + Mat3::Identity() * 1e-7;
 
         Scalar alpha = static_cast<Scalar>(count) / (count + 1);
         R_map = alpha * R_map + (1.0 - alpha) * R_obs;
@@ -112,6 +134,8 @@ struct Gaussian {
         cov += delta * (pt.pos - mean).transpose();
 
         cov = 0.5 * (cov + cov.transpose().eval()); // keep symmetric
+
+        dirty_ = true;
     }
 
     Mat3 getCovariance() const {
@@ -119,23 +143,13 @@ struct Gaussian {
     }
 
     Point getNormal() const {
-        // Get the normal (eigenvector of the smallest eigenvalue)
-        Eigen::SelfAdjointEigenSolver<Mat3> es(getCovariance());
-        Point normal = es.eigenvectors().col(0); 
-
-        return normal;
+        updateCache();
+        return cached_normal_;
     }
 
     Point4 getPlaneEquation() const {
-        // Get the normal (eigenvector of the smallest eigenvalue)
-        Eigen::SelfAdjointEigenSolver<Mat3> es(getCovariance());
-        Point normal = es.eigenvectors().col(0); 
-
-        // Calculate D (distance from origin to plane)
-        // D = -(Ax + By + Cz)
-        Scalar D = -normal.dot(mean);
-
-        return Point4(normal.x(), normal.y(), normal.z(), D);
+        updateCache();
+        return Point4(cached_normal_.x(), cached_normal_.y(), cached_normal_.z(), cached_d_);
     }
 
     Scalar getPlaneDistance(const Point& p) {

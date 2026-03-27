@@ -81,8 +81,6 @@ public:
 
     void update(const VecPointCov& pts, const Mat3& P_curr)
     {
-        DEBUG_PROFILE_SCOPE("Octree::update");
-
         if(pts.empty()) return;
 
         Point min = Point::Constant(std::numeric_limits<Scalar>::max());
@@ -111,8 +109,6 @@ public:
                    std::vector<Gaussian*>& neighbors,
                    std::vector<Scalar>& distances) const
     {
-        DEBUG_PROFILE_SCOPE("Octree::knnSearch");
-
         if(!root_) return;
 
         NeighborHeap heap(k);
@@ -127,14 +123,21 @@ public:
         }
     }
 
+    // k-Nearest Neighbors
+    void knnSearch(const Point& query,
+                   NeighborHeap& heap) const
+    {
+        if(!root_) return;
+
+        knnRecursive(root_, query, heap);
+    }
+
     // Radius search
     void radiusSearch(const Point& query,
                       Scalar radius,
                       std::vector<Gaussian*>& neighbors,
                       std::vector<Scalar>& distances) const
     {
-        DEBUG_PROFILE_SCOPE("Octree::radiusSearch");
-
         if(!root_) return;
 
         neighbors.clear();
@@ -182,8 +185,6 @@ private:
 
     void initialize(const VecPointCov& pts, const Point& min, const Point& max)
     {
-        DEBUG_PROFILE_SCOPE("Octree::initialize");
-
         clear();
 
         Point extent = 0.5 * (max - min);
@@ -202,8 +203,6 @@ private:
                          Scalar extent,
                          const VecPointCov& points)
     {
-        DEBUG_PROFILE_SCOPE("Octree::createOctant");
-
         Octant* oct = allocOctant();
 
         oct->centroid = centroid;
@@ -249,13 +248,16 @@ private:
 
     void expandTree(const Point& boundary)
     {
-        DEBUG_PROFILE_SCOPE("Octree::expandTree");
-
         static const Scalar factor[] = {-0.5,0.5};
+        static const int MAX_EXPANSION = 32;
+        int expansion_count = 0;
 
         while((boundary-root_->centroid).cwiseAbs().maxCoeff()
               > root_->extent)
         {
+            if(++expansion_count > MAX_EXPANSION)
+                break;
+
             Scalar parent_extent = 2*root_->extent;
 
             Point parent_centroid(
@@ -286,8 +288,6 @@ private:
                       const VecPointCov& points,
                       const Mat3& P_curr)
     {
-        DEBUG_PROFILE_SCOPE("Octree::updateOctant");
-
         if(oct->isLeaf())
         {
             for(const auto& pt:points)
@@ -324,7 +324,7 @@ private:
 
         std::vector<VecPointCov> child_pts(8);
 
-        for(const auto& p:points)
+        for(const auto& p : points)
             child_pts[getIdx(p.pos,oct->centroid)].push_back(p);
 
         for(int i=0;i<8;i++)
@@ -333,7 +333,7 @@ private:
 
             if(!oct->children[i])
             {
-                Point c = computeChildCenter(oct->centroid, oct->extent,i);
+                Point c = computeChildCenter(oct->centroid, oct->extent, i);
 
                 oct->children[i] =
                     createOctant(c, 0.5*oct->extent, child_pts[i]);
@@ -353,8 +353,6 @@ private:
 
     void split(Octant* oct)
     {
-        DEBUG_PROFILE_SCOPE("Octree::split");
-
         oct->init_children();
 
         std::vector<std::vector<Gaussian*>> child_gaussians(8);
@@ -397,8 +395,6 @@ private:
 
     void merge(Octant*& oct)
     {
-        DEBUG_PROFILE_SCOPE("Octree::merge");
-
         // To-Do: sort gaussians to avoid O(n^2)
         for(size_t i=0; i < oct->gaussians.size(); i++)
         {
@@ -407,7 +403,7 @@ private:
                 Gaussian* gi = oct->gaussians[i];
                 Gaussian* gj = oct->gaussians[j];
 
-                if(gi->checkFit(gj->mean, gj->cov, chi_threshold_))
+                if(gi->checkFit(gj->mean, gj->getCovariance(), chi_threshold_))
                 {
                     gi->merge(*gj);
                     
@@ -427,8 +423,6 @@ private:
 
     bool knnRecursive(const Octant* oct, const Point& q, NeighborHeap& heap) const
     {
-        DEBUG_PROFILE_SCOPE("Octree::knnRecursive");
-
         if(!oct) return false;
 
         if(oct->isLeaf())
@@ -466,8 +460,6 @@ private:
                          std::vector<Gaussian*>& neighbors,
                          std::vector<Scalar>& distances) const
     {
-        DEBUG_PROFILE_SCOPE("Octree::radiusRecursive");
-
         if(!oct) return;
 
         if(oct->isLeaf())
