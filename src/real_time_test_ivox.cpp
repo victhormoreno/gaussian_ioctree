@@ -29,7 +29,7 @@
 #include <pcl/pcl_config.h>
 
 #include <Eigen/Dense>
-#include "gaussian_octree/gauss_ivox.hpp"
+#include "gaussian_octree/gauss_ivox_octree.hpp"
 
 struct PointType {
     PointType(): data{0.f, 0.f, 0.f, 1.f} {}

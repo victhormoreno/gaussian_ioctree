@@ -83,6 +83,29 @@ else()
 endif()
 
 # -----------------------
+# Test executable: load + publish PCD with ivox
+# -----------------------
+add_executable(static_load_test_unionfind src/static_load_test_unionfind.cpp)
+
+ament_target_dependencies(static_load_test_unionfind
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(static_load_test_unionfind PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(static_load_test_unionfind
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+
+# -----------------------
 # Test executable: real time incremental mapping test
 # -----------------------
 add_executable(real_time_test src/real_time_test.cpp)
@@ -152,6 +175,29 @@ target_link_libraries(incremental_mapping_test
 )
 
 # -----------------------
+# Test executable: incremental mapping test
+# -----------------------
+add_executable(real_time_test_unionfind src/real_time_test_unionfind.cpp)
+
+ament_target_dependencies(real_time_test_unionfind
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(real_time_test_unionfind PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(real_time_test_unionfind
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+
+# -----------------------
 # Install
 # -----------------------
 install(DIRECTORY include/
@@ -161,9 +207,11 @@ install(DIRECTORY include/
 install(TARGETS
   ${PROJECT_NAME}
   static_load_test
+  static_load_test_unionfind
   real_time_test
   real_time_test_ivox
   incremental_mapping_test
+  real_time_test_unionfind
   EXPORT export_${PROJECT_NAME}
   DESTINATION lib/${PROJECT_NAME}
 )

@@ -1,3 +1,5 @@
+#pragma once
+
 #include <Eigen/Dense>
 #include <unordered_map>
 #include <vector>
@@ -8,25 +10,6 @@
 
 #define HASH_P 116101
 #define MAX_N 10000000000
-
-namespace gauss_mapping {
-
-using V3D = Eigen::Vector3d;
-using M3D = Eigen::Matrix3d;
-
-/** * @brief Adjugate matrix for 3x3 to avoid full inverse during covariance propagation
- */
-inline void adjugateM3D(const M3D& A, M3D& A_star) {
-    A_star(0, 0) = A(1, 1) * A(2, 2) - A(1, 2) * A(2, 1);
-    A_star(0, 1) = A(0, 2) * A(2, 1) - A(0, 1) * A(2, 2);
-    A_star(0, 2) = A(0, 1) * A(1, 2) - A(0, 2) * A(1, 1);
-    A_star(1, 0) = A(1, 2) * A(2, 0) - A(1, 0) * A(2, 2);
-    A_star(1, 1) = A(0, 0) * A(2, 2) - A(0, 2) * A(2, 0);
-    A_star(1, 2) = A(0, 2) * A(1, 0) - A(0, 0) * A(1, 2);
-    A_star(2, 0) = A(1, 0) * A(2, 1) - A(1, 1) * A(2, 0);
-    A_star(2, 1) = A(0, 1) * A(2, 0) - A(0, 0) * A(2, 1);
-    A_star(2, 2) = A(0, 0) * A(1, 1) - A(0, 1) * A(1, 0);
-}
 
 class VOXEL_LOC
 {
@@ -56,63 +39,76 @@ namespace std
     };
 }
 
+namespace unionfind_mapping {
+
+using Scalar = double;
+using Point  = Eigen::Matrix<Scalar, 3, 1>;
+using Mat3   = Eigen::Matrix<Scalar, 3, 3>;
+
+/** * @brief Adjugate matrix for 3x3 to avoid full inverse during covariance propagation
+ */
+inline void adjugateMat3(const Mat3& A, Mat3& A_star) {
+    A_star(0, 0) = A(1, 1) * A(2, 2) - A(1, 2) * A(2, 1);
+    A_star(0, 1) = A(0, 2) * A(2, 1) - A(0, 1) * A(2, 2);
+    A_star(0, 2) = A(0, 1) * A(1, 2) - A(0, 2) * A(1, 1);
+    A_star(1, 0) = A(1, 2) * A(2, 0) - A(1, 0) * A(2, 2);
+    A_star(1, 1) = A(0, 0) * A(2, 2) - A(0, 2) * A(2, 0);
+    A_star(1, 2) = A(0, 2) * A(1, 0) - A(0, 0) * A(1, 2);
+    A_star(2, 0) = A(1, 0) * A(2, 1) - A(1, 1) * A(2, 0);
+    A_star(2, 1) = A(0, 1) * A(2, 0) - A(0, 0) * A(2, 1);
+    A_star(2, 2) = A(0, 0) * A(1, 1) - A(0, 1) * A(1, 0);
+}
+
 /*** 3D Point with Covariance ***/
-typedef struct pointWithCov
+struct pointWithCov
 {
-    V3D point;
-    V3D point_world;
-    Eigen::Matrix3d cov;
-    int Semantic_ID = -1;
-} pointWithCov;
+    Point point;
+    Mat3 cov;
+};
 
 /*** Plane Structure ***/
-typedef struct Plane
+struct Plane
 {
-    /*** Update Flag ***/
-    bool is_plane = false;
-    bool is_init = false;
-
     /*** Plane Param ***/
     int main_direction = 0;
-    M3D plane_cov;          
-    V3D n_vec;
+    Mat3 plane_cov;          
+    Point n_vec;
 
     /*** Incremental Calculation Param ***/
-    double xx = 0.0;
-    double yy = 0.0;
-    double zz = 0.0;
-    double xy = 0.0;
-    double xz = 0.0;
-    double yz = 0.0;
-    double x = 0.0;
-    double y = 0.0;
-    double z = 0.0;
-    V3D center = V3D::Zero();
-    Eigen::Matrix3d covariance = M3D::Zero();
+    Scalar xx = 0.0;
+    Scalar yy = 0.0;
+    Scalar zz = 0.0;
+    Scalar xy = 0.0;
+    Scalar xz = 0.0;
+    Scalar yz = 0.0;
+    Scalar x = 0.0;
+    Scalar y = 0.0;
+    Scalar z = 0.0;
+    Point center = Point::Zero();
+    Mat3 covariance = Mat3::Zero();
     int points_size = 0;
-} Plane;
-typedef std::shared_ptr<Plane> PlanePtr;
-typedef const std::shared_ptr<Plane> PlaneConstPtr;
+};
+
+using PlanePtr = std::shared_ptr<Plane>;
+using PlaneConstPtr = const std::shared_ptr<Plane>;
 
 class UnionFindNode {
 public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    PlanePtr plane_ptr_;
+    PlanePtr plane_ptr;
     UnionFindNode *rootNode;
     
     // Instead of std::vector<pointWithCov>, we store points only until 
     // the first InitPlane, then use Incremental calculation.
     std::vector<pointWithCov> buffer_points; 
     
-    bool init_node_ = false;
+    bool init_node = false;
     bool is_plane = false;
-    bool is_NDT = false;
-    int semantic_category = -1;
     int num_points = 0;
-    double voxel_center_[3];
+    Scalar voxel_center_[3];
 
-    UnionFindNode(const VOXEL_LOC& pos, double voxel_sz) {
-        plane_ptr_ = std::make_shared<Plane>();
+    UnionFindNode(const VOXEL_LOC& pos, Scalar voxel_sz) {
+        plane_ptr = std::make_shared<Plane>();
         rootNode = this;
         voxel_center_[0] = (pos.x + 0.5) * voxel_sz;
         voxel_center_[1] = (pos.y + 0.5) * voxel_sz;
@@ -128,8 +124,8 @@ public:
 
 class GaussianIVox {
 public:
-    GaussianIVox(double v_sz, int upd_thresh, double plane_thresh) 
-        : voxel_size_(v_sz), update_threshold_(upd_thresh), planer_threshold_(plane_thresh) {}
+    GaussianIVox(Scalar v_sz, std::size_t upd_thresh) 
+        : voxel_size_(v_sz), update_threshold_(upd_thresh) {}
 
     /**
      * @brief Updates the map with a new point. Handles DSU merging and geometry.
@@ -160,7 +156,7 @@ public:
 
         // Trigger geometry update if threshold reached
         if (root->buffer_points.size() >= update_threshold_) {
-            if (!root->init_node_) {
+            if (!root->init_node) {
                 initPlaneGeometry(root);
             } else {
                 updatePlaneGeometry(root, pos);
@@ -178,7 +174,7 @@ public:
         for (auto const& [loc, node] : feat_map_) {
             // Only return the root of a Union-Find set to avoid duplicates
             if (node->rootNode == node && node->is_plane) {
-                result.push_back(node->plane_ptr_);
+                result.push_back(node->plane_ptr);
             }
         }
         return result;
@@ -189,7 +185,7 @@ private:
      * @brief Initial Plane Fitting and Eigen Decomposition
      */
     void initPlaneGeometry(UnionFindNode* node) {
-        auto& p = node->plane_ptr_;
+        auto& p = node->plane_ptr;
         
         // 1. Incremental Summation (Updating existing Plane stats)
         for (const auto& pv : node->buffer_points) {
@@ -199,7 +195,7 @@ private:
             p->xy += pv.point[0]*pv.point[1]; p->xz += pv.point[0]*pv.point[2]; p->yz += pv.point[1]*pv.point[2];
         }
 
-        double n = static_cast<double>(p->points_size);
+        Scalar n = static_cast<Scalar>(p->points_size);
         p->center << p->x/n, p->y/n, p->z/n;
 
         // 2. Covariance Calculation
@@ -208,15 +204,33 @@ private:
                          p->xz/n - (p->x/n)*(p->z/n), p->yz/n - (p->y/n)*(p->z/n), p->zz/n - (p->z/n)*(p->z/n);
 
         // 3. Eigen Solver for SVD Plane Fitting
-        Eigen::SelfAdjointEigenSolver<M3D> es(p->covariance);
-        V3D evals = es.eigenvalues();
-        
-        if (evals(0) < planer_threshold_) {
-            V3D evecMin = es.eigenvectors().col(0);
+        Eigen::SelfAdjointEigenSolver<Mat3> es(p->covariance);
+        Point evals = es.eigenvalues();
+
+        Scalar l0 = evals(0);
+        Scalar l1 = evals(1);
+        Scalar l2 = evals(2);
+
+        Scalar linearity    = (l2 - l1) / l2;
+        Scalar planarity    = (l1 - l0) / l2;
+        Scalar scattering   = l0 / l2;
+
+        if (planarity > linearity && planarity > scattering) 
+        { // PLANE
+            Point evecMin = es.eigenvectors().col(0);
             solvePlaneParams(node, evecMin); // Logic for main_direction
             node->is_plane = true;
-            node->init_node_ = true;
+            node->init_node = true;
         }
+        else if (linearity > planarity && linearity > scattering) 
+        { // LINE
+            // To-Do: Implement line fitting and merging logic if needed
+        }
+        else 
+        { // VOLUME
+            // To-Do: Implement volume fitting and merging logic if needed
+        }
+        
     }
 
     /**
@@ -242,19 +256,19 @@ private:
     }
 
     void checkAndMerge(UnionFindNode* root_a, UnionFindNode* root_b) {
-        PlanePtr pa = root_a->plane_ptr_;
-        PlanePtr pb = root_b->plane_ptr_;
+        PlanePtr pa = root_a->plane_ptr;
+        PlanePtr pb = root_b->plane_ptr;
         
         if (pa->main_direction == pb->main_direction) {
-            V3D diff = (pa->n_vec - pb->n_vec).cwiseAbs();
+            Point diff = (pa->n_vec - pb->n_vec).cwiseAbs();
             // Mahalanobis distance check for plane similarity
-            double m_dist = std::sqrt(diff.transpose() * (pa->plane_cov + pb->plane_cov).inverse() * diff);
+            Scalar m_dist = std::sqrt(diff.transpose() * (pa->plane_cov + pb->plane_cov).inverse() * diff);
             
-            if (m_dist < 0.004 || (diff[0] < 0.1 && diff[1] < 0.1)) {
+            if (m_dist < Scalar(0.004) || (diff[0] < Scalar(0.1) && diff[1] < Scalar(0.1))) {
                 root_b->rootNode = root_a; // Union operation
                 // Simplified Covariance blending
-                double weight_a = pa->points_size / static_cast<double>(pa->points_size + pb->points_size);
-                double weight_b = 1.0 - weight_a;
+                Scalar weight_a = pa->points_size / static_cast<Scalar>(pa->points_size + pb->points_size);
+                Scalar weight_b = 1.0 - weight_a;
                 pa->n_vec = weight_a * pa->n_vec + weight_b * pb->n_vec;
             }
         }
@@ -263,11 +277,11 @@ private:
     /**
      * @brief Implementation of the 3-case projection (x+ay+bz+d=0, etc.)
      */
-    void solvePlaneParams(UnionFindNode* node, const V3D& evecMin) {
-        auto& p = node->plane_ptr_;
-        M3D A, A_star;
-        V3D E;
-        double n = p->points_size;
+    void solvePlaneParams(UnionFindNode* node, const Point& evecMin) {
+        auto& p = node->plane_ptr;
+        Mat3 A, A_star;
+        Point E;
+        Scalar n = p->points_size;
 
         // Choose projection based on normal vector dominance
         if (std::abs(evecMin[0]) >= std::abs(evecMin[1]) && std::abs(evecMin[0]) >= std::abs(evecMin[2])) {
@@ -284,20 +298,19 @@ private:
             A << p->xx, p->xy, p->x, p->xy, p->yy, p->y, p->x, p->y, n;
         }
 
-        double det = A.determinant();
+        Scalar det = A.determinant();
         if (std::abs(det) > 1e-9) {
-            adjugateM3D(A, A_star);
+            adjugateMat3(A, A_star);
             p->n_vec = A_star * E / det;
             // Note: Full plane_cov propagation requires looping points once or using 
-            // the ddetA_dpw logic from your snippet if specific uncertainty is needed.
+            // the ddetA_dpw logic if specific uncertainty is needed.
         }
     }
 
     mutable std::shared_mutex map_mtx_;
     std::unordered_map<VOXEL_LOC, UnionFindNode*> feat_map_;
-    double voxel_size_;
-    int update_threshold_;
-    double planer_threshold_;
+    Scalar voxel_size_;
+    std::size_t update_threshold_;
 };
 
-} // namespace gauss_mapping
+} // namespace unionfind_mapping
