@@ -1,13 +1,14 @@
-// real_time_test_ivox.cpp
+// static_load_test_ivox.cpp
 //
-// Publishes at LiDAR frequency:
+// Publishes at 1 Hz:
 //  - Filtered PCD cloud on /pcd
 //  - Gaussian ellipsoids on /gaussians
 //
 // Params:
-//  - lidar_topic (string)
-//  - res (double)
-//  - update_thresh (int)
+//  - pcd_path (string)
+//  - leaf_size (double)
+//  - chi (double)
+//  - filter_x (double)         // x,y in [-filter_x, +filter_x]
 
 #include <chrono>
 #include <string>
@@ -22,51 +23,25 @@
 #include "sensor_msgs/msg/point_cloud2.hpp"
 #include "visualization_msgs/msg/marker_array.hpp"
 
-#define PCL_NO_PRECOMPILE
 #include <pcl/io/pcd_io.h>
 #include <pcl/point_types.h>
 #include <pcl/filters/passthrough.h>
 #include <pcl_conversions/pcl_conversions.h>
-#include <pcl/pcl_config.h>
 
 #include <Eigen/Dense>
 #include "gaussian_octree/gauss_ivox.hpp"
 
-struct PointType {
-    PointType(): data{0.f, 0.f, 0.f, 1.f} {}
-    PointType(float x, float y, float z): data{x, y, z, 1.f} {}
-
-    PCL_ADD_POINT4D;
-    float intensity;
-    union {
-      std::uint32_t t;   // (Ouster) time since beginning of scan in nanoseconds
-      float time;        // (Velodyne) time since beginning of scan in seconds
-      double timestamp;  // (Hesai) absolute timestamp in seconds
-                         // (Livox) absolute timestamp in (seconds * 10e9)
-    };
-    EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-} EIGEN_ALIGN16;
-
-
-POINT_CLOUD_REGISTER_POINT_STRUCT(PointType,
-                                 (float, x, x)
-                                 (float, y, y)
-                                 (float, z, z)
-                                 (float, intensity, intensity)
-                                 (std::uint32_t, t, t)
-                                 (float, time, time)
-                                 (double, timestamp, timestamp))
-
 using namespace std::chrono_literals;
 
-class GaussianIVoxRealTime : public rclcpp::Node {
+class GaussianIVOXStaticLoad : public rclcpp::Node {
 public:
-  GaussianIVoxRealTime() : Node("gaussian_ivox_test")
+  GaussianIVOXStaticLoad() : Node("gaussian_ivox_test")
   {
     // ---- params (only these) ----
-    lidar_topic_      = this->declare_parameter<std::string>("lidar_topic", "/lidar_points");
+    pcd_path_         = this->declare_parameter<std::string>("pcd_path", "");
     resolution_       = this->declare_parameter<double>("res", 2.0);
     update_threshold_ = this->declare_parameter<int>("update_thresh", 5);
+    filter_x_         = this->declare_parameter<double>("filter_x", 10.0);
 
     // fixed topics/frames
     frame_id_ = "map";
@@ -74,8 +49,10 @@ public:
     gaussian_topic_ = "/gaussians";
     voxel_topic_ = "/voxels";
 
+    if (pcd_path_.empty()) throw std::runtime_error("pcd_path is empty");
     if (resolution_ <= 0.0) resolution_ = 0.001;
     if (update_threshold_ <= 0) update_threshold_ = 5;
+    if (filter_x_ <= 0.0) filter_x_ = 0.001;
 
     cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       topic_, rclcpp::QoS(1).transient_local());
@@ -84,73 +61,118 @@ public:
     voxel_pub_ = this->create_publisher<visualization_msgs::msg::MarkerArray>(
       voxel_topic_, rclcpp::QoS(1).transient_local());
 
-    lidar_sub_ = this->create_subscription<sensor_msgs::msg::PointCloud2>(
-                    lidar_topic_, 1, std::bind(&GaussianIVoxRealTime::lidar_callback, this, std::placeholders::_1));
+    load_and_filter_once();
+    build_map_once();
 
-    // Declare Incremental Voxel
+    // Publish periodically (1 Hz)
+    timer_ = this->create_wall_timer(1s, [this]() { publish_once(); });
+
+    RCLCPP_INFO(get_logger(),
+                "Ready: pcd='%s' res=%.6f update_thresh=%d (publishing 1 Hz)",
+                pcd_path_.c_str(), resolution_, update_threshold_);
+  }
+
+private:
+  void load_and_filter_once() {
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud(new pcl::PointCloud<pcl::PointXYZI>());
+    int ret = pcl::io::loadPCDFile<pcl::PointXYZI>(pcd_path_, *cloud);
+    if (ret < 0) throw std::runtime_error("Failed to load PCD");
+
+    // x in [-x, +x]
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_x(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::PassThrough<pcl::PointXYZI> pass_x;
+    pass_x.setInputCloud(cloud);
+    pass_x.setFilterFieldName("x");
+    pass_x.setFilterLimits(static_cast<float>(-filter_x_), static_cast<float>(+filter_x_));
+    pass_x.filter(*cloud_x);
+
+    // y in [-x, +x]
+    pcl::PointCloud<pcl::PointXYZI>::Ptr cloud_xy(new pcl::PointCloud<pcl::PointXYZI>());
+    pcl::PassThrough<pcl::PointXYZI> pass_y;
+    pass_y.setInputCloud(cloud_x);
+    pass_y.setFilterFieldName("y");
+    pass_y.setFilterLimits(static_cast<float>(-filter_x_), static_cast<float>(+filter_x_));
+    pass_y.filter(*cloud_xy);
+
+    filtered_cloud_ = cloud_xy;
+
+    pcl::toROSMsg(*filtered_cloud_, cloud_msg_);
+    cloud_msg_.header.frame_id = frame_id_;
+    cloud_loaded_ = true;
+
+    RCLCPP_INFO(get_logger(), "PCD: %zu -> %zu points (filter_x=%.3f)",
+                cloud->size(), filtered_cloud_->size(), filter_x_);
+  }
+
+  void build_map_once() {
+    if (!filtered_cloud_ || filtered_cloud_->empty())
+      throw std::runtime_error("Filtered cloud is empty");
+
+    // point covariance
+    const gauss_ivox_mapping::Mat3 p_cov = 0.01 * gauss_ivox_mapping::Mat3::Identity();
+    // const gauss_ivox_mapping::Mat3 P_curr = p_cov;
+
     ivox_ = std::make_unique<gauss_ivox_mapping::GaussianIVox>(
       static_cast<gauss_ivox_mapping::Scalar>(resolution_),
       static_cast<std::size_t>(update_threshold_)
     );
 
-    RCLCPP_INFO(get_logger(),
-                "Ready: topic='%s' res=%.3f update_thresh=%d",
-                lidar_topic_.c_str(), resolution_, update_threshold_);
-  }
-
-private:
-  void lidar_callback(const sensor_msgs::msg::PointCloud2 & msg) {
-
-    pcl::PointCloud<PointType>::Ptr pc_ (std::make_shared<pcl::PointCloud<PointType>>());
-    pcl::fromROSMsg(msg, *pc_);
-
-    // point covariance
-    const gauss_ivox_mapping::Mat3 p_cov = 0.001 * gauss_ivox_mapping::Mat3::Identity();
-    // const gauss_ivox_mapping::Mat3 P_curr = p_cov; // fixed eKF covariance
-
     auto tick = std::chrono::system_clock::now(); 
-    for (const auto& p : pc_->points) {
+    for (const auto& p : filtered_cloud_->points) {
+      if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
       gauss_ivox_mapping::pointWithCov pos;
       pos.point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
-                    static_cast<gauss_ivox_mapping::Scalar>(p.y),
-                    static_cast<gauss_ivox_mapping::Scalar>(p.z);
+                  static_cast<gauss_ivox_mapping::Scalar>(p.y),
+                  static_cast<gauss_ivox_mapping::Scalar>(p.z);
       pos.cov = p_cov;
       ivox_->update(pos);
     }
     auto tack = std::chrono::system_clock::now();
 
     std::chrono::duration<double> elapsed_time = tack-tick;
+    
+    map_loaded_ = true;
 
-    // RCLCPP_INFO(get_logger(), "Ivox contains %zu gaussians (%zu points) and took %f ms to update",
-    //             ivox_->size(), ivox_->num_points(), elapsed_time.count()*1000.0);
+    cached_gauss_.clear();
+    cached_gauss_ = ivox_->getGaussians();
 
-    cloud_pub_->publish(msg);
+    RCLCPP_INFO(get_logger(), "Map contains %zu gaussians and took %f ms to load",
+                cached_gauss_.size(), elapsed_time.count()*1000.0);
+  }
 
+  void publish_once() {
+    if (!cloud_loaded_ || !map_loaded_) return;
+    const auto stamp = this->now();
 
-    std::vector<gauss_ivox_mapping::GaussPtr> gauss = ivox_->getGaussians();
+    cloud_msg_.header.stamp = stamp;
+    cloud_pub_->publish(cloud_msg_);
 
-    RCLCPP_INFO(get_logger(), "Ivox has %zu active gaussians and took %f ms to update", gauss.size(), elapsed_time.count()*1000.0);
+    gauss_pub_->publish(makeGaussianMarkers(stamp));
 
-    gauss_pub_->publish(makeGaussianMarkers(gauss, this->now()));
-    voxel_pub_->publish(makeVoxelMarkers(*ivox_.get(), this->now(), resolution_));
-
+    voxel_pub_->publish(makeVoxelMarkers(*ivox_.get(), stamp, resolution_));
   }
 
   visualization_msgs::msg::MarkerArray makeGaussianMarkers(
-      const std::vector<gauss_ivox_mapping::GaussPtr>& gauss,
       const rclcpp::Time& stamp) const
   {
       visualization_msgs::msg::MarkerArray arr;
+      if (!map_loaded_) return arr;
 
-      const size_t max_markers = 5000; // safety limit to avoid overloading RViz, can be adjusted as needed
-      const size_t n = std::min(max_markers, gauss.size());
+      visualization_msgs::msg::Marker del;
+      del.header.frame_id = frame_id_;
+      del.header.stamp = stamp;
+      del.ns = "gaussians";
+      del.id = 0;
+      del.action = visualization_msgs::msg::Marker::DELETEALL;
+      arr.markers.push_back(del);
 
+      const size_t n = cached_gauss_.size();
       arr.markers.reserve(n);
 
       int id = 0;
 
       for (size_t i = 0; i < n; ++i) {
-          const auto& g = *gauss[n - 1 - i];
+          const auto& g = *cached_gauss_[i];
 
           visualization_msgs::msg::Marker m;
 
@@ -401,30 +423,37 @@ private:
 
 private:
   // params
+  std::string pcd_path_;
   double resolution_{5.0};
   int update_threshold_{5};
+  double filter_x_{10.0};
 
   // fixed
-  std::string lidar_topic_{""};
-  std::string frame_id_{"map"};
-  std::string topic_{"/pcd"};
-  std::string gaussian_topic_{"/gaussians"};
-  std::string voxel_topic_{"/voxels"};
+  std::string frame_id_;
+  std::string topic_;
+  std::string gaussian_topic_;
+  std::string voxel_topic_;
 
-  // map
+  // state
+  bool cloud_loaded_{false};
+  bool map_loaded_{false};
+  sensor_msgs::msg::PointCloud2 cloud_msg_;
+  pcl::PointCloud<pcl::PointXYZI>::Ptr filtered_cloud_{nullptr};
+
   std::unique_ptr<gauss_ivox_mapping::GaussianIVox> ivox_{nullptr};
+  std::vector<gauss_ivox_mapping::GaussPtr> cached_gauss_;
 
   // ros
   rclcpp::Publisher<sensor_msgs::msg::PointCloud2>::SharedPtr cloud_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr gauss_pub_;
   rclcpp::Publisher<visualization_msgs::msg::MarkerArray>::SharedPtr voxel_pub_;
-  rclcpp::Subscription<sensor_msgs::msg::PointCloud2>::SharedPtr lidar_sub_;
+  rclcpp::TimerBase::SharedPtr timer_;
 };
 
 int main(int argc, char** argv) {
   rclcpp::init(argc, argv);
   try {
-    auto node = std::make_shared<GaussianIVoxRealTime>();
+    auto node = std::make_shared<GaussianIVOXStaticLoad>();
     rclcpp::spin(node);
   } catch (const std::exception& e) {
     RCLCPP_ERROR(rclcpp::get_logger("gaussian_ivox_test"), "Exception: %s", e.what());

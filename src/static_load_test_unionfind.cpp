@@ -1,4 +1,4 @@
-// static_load_test.cpp
+// static_load_test_unionfind.cpp
 //
 // Publishes at 1 Hz:
 //  - Filtered PCD cloud on /pcd

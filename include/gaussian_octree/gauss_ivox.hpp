@@ -28,20 +28,6 @@ struct HashVec3i {
     }
 };
 
-/** * @brief Adjugate matrix for 3x3 to avoid full inverse during covariance propagation
- */
-inline void adjugateMat3(const Mat3& A, Mat3& A_star) {
-    A_star(0, 0) = A(1, 1) * A(2, 2) - A(1, 2) * A(2, 1);
-    A_star(0, 1) = A(0, 2) * A(2, 1) - A(0, 1) * A(2, 2);
-    A_star(0, 2) = A(0, 1) * A(1, 2) - A(0, 2) * A(1, 1);
-    A_star(1, 0) = A(1, 2) * A(2, 0) - A(1, 0) * A(2, 2);
-    A_star(1, 1) = A(0, 0) * A(2, 2) - A(0, 2) * A(2, 0);
-    A_star(1, 2) = A(0, 2) * A(1, 0) - A(0, 0) * A(1, 2);
-    A_star(2, 0) = A(1, 0) * A(2, 1) - A(1, 1) * A(2, 0);
-    A_star(2, 1) = A(0, 1) * A(2, 0) - A(0, 0) * A(2, 1);
-    A_star(2, 2) = A(0, 0) * A(1, 1) - A(0, 1) * A(1, 0);
-}
-
 /*** 3D Point with Covariance ***/
 struct pointWithCov
 {
@@ -148,16 +134,32 @@ public:
     std::vector<GaussPtr> getGaussians() const {
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
         std::vector<GaussPtr> result;
-        for (auto const& [loc, node] : map_) {
-            // Only return the root of a Union-Find set to avoid duplicates
-            if (node->rootNode == node) {
-                result.push_back(node->gauss_ptr);
-            }
+        for (auto const& [_, node] : map_) {
+            if (node->rootNode != node) continue; // only roots
+            result.push_back(node->gauss_ptr);
         }
         return result;
     }
 
-private:
+    /**
+     * @brief Thread-safe retrieval of selected type gaussians
+     */
+    std::vector<GaussPtr> getByType(PrimitiveType type) const {
+        std::shared_lock<std::shared_mutex> lock(map_mtx_);
+        std::vector<GaussPtr> result;
+        for (const auto& [_, node] : map_) {
+            if (node->rootNode != node) continue; // only roots
+
+            const auto& g = node->gauss_ptr;
+            if (g && g->type == type) {
+                result.push_back(g);
+            }
+        }
+
+        return result;
+    }
+
+// private:
     /**
      * @brief Initial Gaussian Fitting and Eigen Decomposition
      */
@@ -198,9 +200,7 @@ private:
 
             // Plane normal: eigenvector of smallest eigenvalue
             Point evecMin = es.eigenvectors().col(0);
-
-            // Main direction and normal vector calculation
-            solvePlaneParams(node, evecMin);
+            g->n_vec = evecMin.normalized();
         }
         else if (linearity > planarity && linearity > scattering) {
             g->type = PrimitiveType::LINE;
@@ -234,13 +234,13 @@ private:
             if (it != map_.end()) {
                 UnionFindNode* neighbor_root = it->second->find();
                 if (neighbor_root != node) {
-                    checkAndMerge(node, neighbor_root);
+                    checkAndMerge(node, neighbor_root, v_size_);
                 }
             }
         }
     }
 
-    void checkAndMerge(UnionFindNode* root_a, UnionFindNode* root_b) {
+    void checkAndMerge(UnionFindNode* root_a, UnionFindNode* root_b, Scalar &voxel_size) {
         GaussPtr ga = root_a->gauss_ptr;
         GaussPtr gb = root_b->gauss_ptr;
 
@@ -251,49 +251,64 @@ private:
 
         switch (ga->type) {
             case PrimitiveType::PLANE: {
-                // Mahalanobis distance on normals for plane similarity
-                Point diff = ga->n_vec - gb->n_vec;
-                Mat3 cov_sum = ga->cov + gb->cov;
-                if (cov_sum.determinant() > 1e-12) { // avoid singular
-                    Scalar m_dist = std::sqrt(diff.transpose() * cov_sum.inverse() * diff);
-                    if (m_dist < Scalar(0.004)) {
-                        can_merge = true;
-                    }
-                }
+                // --- Check normal alignment ---
+                Scalar cos_theta = ga->n_vec.dot(gb->n_vec);
+                cos_theta = std::clamp(cos_theta, Scalar(-1.0), Scalar(1.0));
+                Scalar angle = std::acos(cos_theta); // radians
+                constexpr Scalar max_angle = 5.0 * M_PI / 180.0; // 5 degrees
+                if (angle > max_angle) break;
+
+                // --- Check plane distance along normal ---
+                Point diff = gb->mean - ga->mean;
+                Scalar dist = std::abs(diff.dot(ga->n_vec));
+                Scalar max_dist = voxel_size; // threshold can be tuned
+                if (dist > max_dist) break;
+
+                can_merge = true;
                 break;
             }
+
             case PrimitiveType::LINE: {
-                // Angle between line directions
+                // --- Angle between line directions ---
                 Scalar cos_angle = ga->direction.dot(gb->direction);
-                if (cos_angle > Scalar(0.995)) { // ~5° threshold
-                    can_merge = true;
-                }
+                cos_angle = std::clamp(cos_angle, Scalar(-1.0), Scalar(1.0));
+                Scalar angle = std::acos(cos_angle);
+                constexpr Scalar max_angle = 5.0 * M_PI / 180.0; // 5 degrees
+                if (angle > max_angle) break;
+
+                // --- Distance between lines ---
+                Point delta = gb->mean - ga->mean;
+                Point cross_dir = ga->direction.cross(delta);
+                Scalar dist = cross_dir.norm();
+                Scalar max_dist = voxel_size; // threshold can be tuned
+                if (dist > max_dist) break;
+
+                can_merge = true;
                 break;
             }
+
             case PrimitiveType::VOLUME: {
-                // Mahalanobis distance on means for Gaussian similarity
-                Point diff = ga->mean - gb->mean;
+                // --- Mahalanobis distance on means for Gaussian similarity ---
+                Point diff = gb->mean - ga->mean;
                 Mat3 cov_sum = ga->cov + gb->cov;
-                if (cov_sum.determinant() > 1e-12) {
-                    Scalar m_dist = std::sqrt(diff.transpose() * cov_sum.inverse() * diff);
-                    if (m_dist < Scalar(0.1)) { // To-Do: adjust threshold to voxel scale
-                        can_merge = true;
-                    }
-                }
+                cov_sum += Mat3::Identity() * 1e-6; // regularization
+                if (cov_sum.determinant() < 1e-12) break;
+
+                Scalar m_dist = std::sqrt(diff.transpose() * cov_sum.inverse() * diff);
+                Scalar max_mdist = voxel_size; // threshold can be tuned
+                if (m_dist > max_mdist) break;
+
+                can_merge = true;
                 break;
             }
         }
 
         if (!can_merge) return;
 
-        // -----------------------
         // Union operation
-        // -----------------------
         root_b->rootNode = root_a;
 
-        // -----------------------
         // Merge Gaussian statistics (all types use same formula)
-        // -----------------------
         int nA = ga->count;
         int nB = gb->count;
         int n  = nA + nB;
@@ -316,37 +331,9 @@ private:
         } else if (ga->type == PrimitiveType::LINE) {
             ga->direction = ((nA * ga->direction + nB * gb->direction) / n).normalized();
         }
-    }
 
-    /**
-     * @brief Implementation of the 3-case projection (x+ay+bz+d=0, etc.)
-     */
-    void solvePlaneParams(UnionFindNode* node, const Point& evecMin) {
-        auto& p = node->gauss_ptr;
-        Mat3 A, A_star;
-        Point E;
-        Scalar n = p->count;
-
-        // Choose projection based on normal vector dominance
-        if (std::abs(evecMin[0]) >= std::abs(evecMin[1]) && std::abs(evecMin[0]) >= std::abs(evecMin[2])) {
-            p->main_direction = 2; // x-dominant
-            E << -p->xy, -p->xz, -p->x;
-            A << p->yy, p->yz, p->y, p->yz, p->zz, p->z, p->y, p->z, n;
-        } else if (std::abs(evecMin[1]) >= std::abs(evecMin[0]) && std::abs(evecMin[1]) >= std::abs(evecMin[2])) {
-            p->main_direction = 1; // y-dominant
-            E << -p->xy, -p->yz, -p->y;
-            A << p->xx, p->xz, p->x, p->xz, p->zz, p->z, p->x, p->z, n;
-        } else {
-            p->main_direction = 0; // z-dominant
-            E << -p->xz, -p->yz, -p->z;
-            A << p->xx, p->xy, p->x, p->xy, p->yy, p->y, p->x, p->y, n;
-        }
-
-        Scalar det = A.determinant();
-        if (std::abs(det) > 1e-9) {
-            adjugateMat3(A, A_star);
-            p->n_vec = A_star * E / det;
-        }
+        // Remove primitive from non-root
+        root_b->gauss_ptr.reset(); 
     }
 
     mutable std::shared_mutex map_mtx_;

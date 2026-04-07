@@ -106,6 +106,29 @@ target_link_libraries(static_load_test_unionfind
 )
 
 # -----------------------
+# Test executable: load + publish PCD with ivox
+# -----------------------
+add_executable(static_load_test_ivox src/static_load_test_ivox.cpp)
+
+ament_target_dependencies(static_load_test_ivox
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(static_load_test_ivox PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(static_load_test_ivox
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+
+# -----------------------
 # Test executable: real time incremental mapping test
 # -----------------------
 add_executable(real_time_test src/real_time_test.cpp)
@@ -147,6 +170,29 @@ target_include_directories(real_time_test_ivox PRIVATE
 
 # Link libraries 
 target_link_libraries(real_time_test_ivox
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+
+# -----------------------
+# Test executable: real time incremental mapping test with ivox octree
+# -----------------------
+add_executable(real_time_test_ivox_octree src/real_time_test_ivox_octree.cpp)
+
+ament_target_dependencies(real_time_test_ivox_octree
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(real_time_test_ivox_octree PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(real_time_test_ivox_octree
   ${PROJECT_NAME}
   ${PCL_LIBRARIES}
 )
@@ -208,8 +254,10 @@ install(TARGETS
   ${PROJECT_NAME}
   static_load_test
   static_load_test_unionfind
+  static_load_test_ivox
   real_time_test
   real_time_test_ivox
+  real_time_test_ivox_octree
   incremental_mapping_test
   real_time_test_unionfind
   EXPORT export_${PROJECT_NAME}
