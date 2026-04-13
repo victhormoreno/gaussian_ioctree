@@ -29,7 +29,8 @@
 #include <pcl_conversions/pcl_conversions.h>
 
 #include <Eigen/Dense>
-#include "gaussian_octree/gauss_ivox.hpp"
+// #include "gaussian_octree/gauss_ivox.hpp"
+#include "gaussian_octree/gauss_ivox_dummy.hpp"
 
 using namespace std::chrono_literals;
 
@@ -147,7 +148,8 @@ private:
     cloud_msg_.header.stamp = stamp;
     cloud_pub_->publish(cloud_msg_);
 
-    gauss_pub_->publish(makeGaussianMarkers(stamp));
+    // gauss_pub_->publish(makeGaussianMarkers(stamp));
+    gauss_pub_->publish(makeGaussianMarkers(*ivox_.get(), stamp));
 
     voxel_pub_->publish(makeVoxelMarkers(*ivox_.get(), stamp, resolution_));
   }
@@ -175,6 +177,8 @@ private:
           const auto& g = *cached_gauss_[i];
 
           visualization_msgs::msg::Marker m;
+
+          std::cout << "Gauss Type: " << static_cast<int>(g.type) << " Count: " << g.count << std::endl; // --- DEBUG ---
 
           switch (g.type) {
               case gauss_ivox_mapping::PrimitiveType::PLANE:
@@ -405,9 +409,9 @@ private:
           m.id = id++;
           m.type = visualization_msgs::msg::Marker::CUBE;
           m.action = visualization_msgs::msg::Marker::ADD;
-          m.pose.position.x = node->voxel_center_[0];
-          m.pose.position.y = node->voxel_center_[1];
-          m.pose.position.z = node->voxel_center_[2];
+          m.pose.position.x = node->voxel_center[0];
+          m.pose.position.y = node->voxel_center[1];
+          m.pose.position.z = node->voxel_center[2];
           m.pose.orientation.w = 1.0;
           m.scale.x = voxel_size;
           m.scale.y = voxel_size;
@@ -420,6 +424,244 @@ private:
       
       return arr;
   }
+
+visualization_msgs::msg::MarkerArray makeGaussianMarkers(
+      const gauss_ivox_mapping::GaussianIVox& ivox,
+      const rclcpp::Time& stamp)
+  {
+      visualization_msgs::msg::MarkerArray arr;
+      if (!map_loaded_) return arr;
+
+      visualization_msgs::msg::Marker del;
+      del.header.frame_id = frame_id_;
+      del.header.stamp = stamp;
+      del.ns = "gaussians";
+      del.id = 0;
+      del.action = visualization_msgs::msg::Marker::DELETEALL;
+      arr.markers.push_back(del);
+    //   std::shared_lock lock(ivox.map_mtx_); // safe map access
+
+      std::mt19937 gen(12345); // fixed seed for consistent cluster colors
+      std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+      std::unordered_map<gauss_ivox_mapping::UnionFindNode*, std::tuple<float,float,float>> parent_colors;
+
+      int id = 0;
+      for (const auto& [key, node] : ivox.map_) {
+          auto* root = node->find();
+          if (parent_colors.find(root) == parent_colors.end()) {
+              parent_colors[root] = {dis(gen), dis(gen), dis(gen)};
+          }
+
+          auto& gaus = node->gauss_ptr;
+          if (!gaus) continue; // if not root skip (will not have geometry)
+
+        //   std::cout << "Gauss Type: " << static_cast<int>(gaus->type) << " Count: " << gaus->count << std::endl; // --- DEBUG ---
+
+          visualization_msgs::msg::Marker m;
+          id++; // increment here to ensure unique IDs even if type is unknown
+
+          switch (gaus->type) {
+              case gauss_ivox_mapping::PrimitiveType::PLANE:
+                  std::cout << "Making plane marker for node with count: " << gaus->count << std::endl; // --- DEBUG ---
+                  m = makePlaneMarker(*gaus, id, stamp, parent_colors[root]);
+                  break;
+
+              case gauss_ivox_mapping::PrimitiveType::LINE:
+                  std::cout << "Making line marker for node with count: " << gaus->count << std::endl; // --- DEBUG ---
+                  m = makeLineMarker(*gaus, id, stamp, parent_colors[root]);
+                  break;
+
+              case gauss_ivox_mapping::PrimitiveType::VOLUME:
+                  std::cout << "Making volume marker for node with count: " << gaus->count << std::endl; // --- DEBUG ---
+                  m = makeVolumeMarker(*gaus, id, stamp, parent_colors[root]);
+                  break;
+
+              default:
+                  break;
+          }
+
+          arr.markers.push_back(m);
+      }
+      
+      return arr;
+  }
+
+  visualization_msgs::msg::Marker makePlaneMarker(
+      const gauss_ivox_mapping::GaussianPrimitive& g,
+      int id,
+      const rclcpp::Time& stamp,
+      std::tuple<float,float,float>& color) const
+  {
+      visualization_msgs::msg::Marker m;
+
+      const double plane_size = 2.0;
+      const double thickness = 0.02;
+
+      Eigen::Vector3d normal = g.n_vec;
+      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
+      normal.normalize();
+
+      Eigen::Vector3d z_axis = normal;
+
+      // Pick a WORLD axis that is least aligned with the normal
+      Eigen::Vector3d ref_axis;
+      if (std::abs(z_axis.x()) <= std::abs(z_axis.y()) &&
+          std::abs(z_axis.x()) <= std::abs(z_axis.z())) {
+          ref_axis = Eigen::Vector3d::UnitX();
+      }
+      else if (std::abs(z_axis.y()) <= std::abs(z_axis.z())) {
+          ref_axis = Eigen::Vector3d::UnitY();
+      }
+      else {
+          ref_axis = Eigen::Vector3d::UnitZ();
+      }
+
+      // Build orthonormal basis
+      Eigen::Vector3d x_axis = ref_axis.cross(z_axis).normalized();
+      Eigen::Vector3d y_axis = z_axis.cross(x_axis).normalized();
+
+      Eigen::Matrix3d R;
+      R.col(0) = x_axis;
+      R.col(1) = y_axis;
+      R.col(2) = normal;
+
+      Eigen::Quaterniond q(R);
+
+      m.header.frame_id = frame_id_;
+      m.header.stamp = stamp;
+      m.ns = "planes";
+      m.id = id;
+      m.type = visualization_msgs::msg::Marker::CUBE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+
+      m.pose.position.x = g.mean.x();
+      m.pose.position.y = g.mean.y();
+      m.pose.position.z = g.mean.z();
+
+      m.pose.orientation.x = q.x();
+      m.pose.orientation.y = q.y();
+      m.pose.orientation.z = q.z();
+      m.pose.orientation.w = q.w();
+
+
+      m.scale.x = plane_size * sqrt(g.cov(0,0)); // spread along x-axis;
+      m.scale.y = plane_size * sqrt(g.cov(1,1)); // spread along y-axis;
+      m.scale.z = thickness;
+    //   m.scale.z = sqrt(g.cov(2,2)); // spread along z-axis
+
+      m.color.r = std::get<0>(color);
+      m.color.g = std::get<1>(color);
+      m.color.b = std::get<2>(color);
+      m.color.a = 0.8f;
+
+      m.lifetime = rclcpp::Duration(0, 0);
+
+      return m;
+  }
+
+  visualization_msgs::msg::Marker makeLineMarker(
+      const gauss_ivox_mapping::GaussianPrimitive& g,
+      int id,
+      const rclcpp::Time& stamp,
+      std::tuple<float,float,float>& color
+    ) const
+  {
+      visualization_msgs::msg::Marker m;
+
+      const double length = 1.0;
+
+      Eigen::Vector3d dir = g.direction;
+      if (dir.norm() < 1e-6) dir = Eigen::Vector3d::UnitX();
+      dir.normalize();
+
+      Eigen::Quaterniond q = Eigen::Quaterniond::FromTwoVectors(
+          Eigen::Vector3d::UnitX(), dir);
+
+      m.header.frame_id = frame_id_;
+      m.header.stamp = stamp;
+      m.ns = "lines";
+      m.id = id;
+      m.type = visualization_msgs::msg::Marker::ARROW;
+      m.action = visualization_msgs::msg::Marker::ADD;
+
+      m.pose.position.x = g.mean.x();
+      m.pose.position.y = g.mean.y();
+      m.pose.position.z = g.mean.z();
+
+      m.pose.orientation.x = q.x();
+      m.pose.orientation.y = q.y();
+      m.pose.orientation.z = q.z();
+      m.pose.orientation.w = q.w();
+
+      m.scale.x = length;   // shaft length
+      m.scale.y = 0.05;     // shaft diameter
+      m.scale.z = 0.1;      // head diameter
+
+      m.color.r = std::get<0>(color);
+      m.color.g = std::get<1>(color);
+      m.color.b = std::get<2>(color);
+      m.color.a = 0.8f;
+
+      m.lifetime = rclcpp::Duration(0, 0);
+
+      return m;
+  }
+
+  visualization_msgs::msg::Marker makeVolumeMarker(
+      const gauss_ivox_mapping::GaussianPrimitive& g,
+      int id,
+      const rclcpp::Time& stamp,
+      std::tuple<float,float,float>& color
+    ) const
+  {
+      visualization_msgs::msg::Marker m;
+
+      const double k_sigma = 1.0;
+
+      Eigen::SelfAdjointEigenSolver<gauss_ivox_mapping::Mat3> es(g.cov);
+      if (es.info() != Eigen::Success) return m;
+
+      Eigen::Vector3d evals = es.eigenvalues();
+      Eigen::Matrix3d evecs = es.eigenvectors();
+
+      constexpr double EPS = 1e-12;
+      evals = evals.cwiseMax(EPS);
+
+      if (evecs.determinant() < 0.0)
+          evecs.col(0) *= -1.0;
+
+      Eigen::Quaterniond q(evecs);
+
+      m.header.frame_id = frame_id_;
+      m.header.stamp = stamp;
+      m.ns = "volumes";
+      m.id = id;
+      m.type = visualization_msgs::msg::Marker::SPHERE;
+      m.action = visualization_msgs::msg::Marker::ADD;
+
+      m.pose.position.x = g.mean.x();
+      m.pose.position.y = g.mean.y();
+      m.pose.position.z = g.mean.z();
+
+      m.pose.orientation.x = q.x();
+      m.pose.orientation.y = q.y();
+      m.pose.orientation.z = q.z();
+      m.pose.orientation.w = q.w();
+
+      m.scale.x = 2.0 * k_sigma * std::sqrt(evals(0));
+      m.scale.y = 2.0 * k_sigma * std::sqrt(evals(1));
+      m.scale.z = 2.0 * k_sigma * std::sqrt(evals(2));
+
+      m.color.r = std::get<0>(color);
+      m.color.g = std::get<1>(color);
+      m.color.b = std::get<2>(color);
+      m.color.a = 0.8f;
+
+      m.lifetime = rclcpp::Duration(0, 0);
+
+      return m;
+  }
+
 
 private:
   // params

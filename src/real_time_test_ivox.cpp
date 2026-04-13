@@ -30,7 +30,8 @@
 #include <pcl/pcl_config.h>
 
 #include <Eigen/Dense>
-#include "gaussian_octree/gauss_ivox.hpp"
+// #include "gaussian_octree/gauss_ivox.hpp"
+#include "gaussian_octree/gauss_ivox_dummy.hpp"
 
 struct PointType {
     PointType(): data{0.f, 0.f, 0.f, 1.f} {}
@@ -131,61 +132,67 @@ private:
 
     RCLCPP_INFO(get_logger(), "Ivox has %zu active gaussians and took %f ms to update", gauss.size(), elapsed_time.count()*1000.0);
 
-    gauss_pub_->publish(makeGaussianMarkers(gauss, this->now()));
+    gauss_pub_->publish(makeGaussianMarkers(*ivox_.get(), this->now()));
     voxel_pub_->publish(makeVoxelMarkers(*ivox_.get(), this->now(), resolution_));
 
   }
 
   visualization_msgs::msg::MarkerArray makeGaussianMarkers(
-      const std::vector<gauss_ivox_mapping::GaussPtr>& gauss,
-      const rclcpp::Time& stamp) const
+      const gauss_ivox_mapping::GaussianIVox& ivox,
+      const rclcpp::Time& stamp)
   {
       visualization_msgs::msg::MarkerArray arr;
+      std::shared_lock lock(ivox.map_mtx_); // safe map access
 
-      const size_t max_markers = 5000; // safety limit to avoid overloading RViz, can be adjusted as needed
-      const size_t n = std::min(max_markers, gauss.size());
-
-      arr.markers.reserve(n);
+      std::mt19937 gen(12345); // fixed seed for consistent cluster colors
+      std::uniform_real_distribution<float> dis(0.0f, 1.0f);
+      std::unordered_map<gauss_ivox_mapping::UnionFindNode*, std::tuple<float,float,float>> parent_colors;
 
       int id = 0;
+      for (const auto& [key, node] : ivox.map_) {
+          auto* root = node->find();
+          if (parent_colors.find(root) == parent_colors.end()) {
+              parent_colors[root] = {dis(gen), dis(gen), dis(gen)};
+          }
 
-      for (size_t i = 0; i < n; ++i) {
-          const auto& g = *gauss[n - 1 - i];
+          auto& gaus = node->gauss_ptr;
+          if (!gaus) continue; // if not root skip (will not have geometry)
 
           visualization_msgs::msg::Marker m;
 
-          switch (g.type) {
+          switch (gaus->type) {
               case gauss_ivox_mapping::PrimitiveType::PLANE:
-                  m = makePlaneMarker(g, id++, stamp);
+                  m = makePlaneMarker(*gaus, id++, stamp, parent_colors[root]);
                   break;
 
               case gauss_ivox_mapping::PrimitiveType::LINE:
-                  m = makeLineMarker(g, id++, stamp);
+                  m = makeLineMarker(*gaus, id++, stamp, parent_colors[root]);
                   break;
 
               case gauss_ivox_mapping::PrimitiveType::VOLUME:
-                  m = makeVolumeMarker(g, id++, stamp);
+                  m = makeVolumeMarker(*gaus, id++, stamp, parent_colors[root]);
                   break;
 
               default:
-                  continue;
+                  break;
           }
 
           arr.markers.push_back(m);
       }
-
+      
       return arr;
   }
 
   visualization_msgs::msg::Marker makePlaneMarker(
       const gauss_ivox_mapping::GaussianPrimitive& g,
       int id,
-      const rclcpp::Time& stamp) const
+      const rclcpp::Time& stamp,
+      std::tuple<float,float,float>& color) const
   {
       visualization_msgs::msg::Marker m;
 
       const double plane_size = 1.0;
-      const double thickness  = 0.02;
+      const double thickness = 0.002;
 
       Eigen::Vector3d normal = g.n_vec;
       if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
@@ -233,16 +240,14 @@ private:
       m.pose.orientation.z = q.z();
       m.pose.orientation.w = q.w();
 
-      m.scale.x = plane_size;
-      m.scale.y = plane_size;
+      m.scale.x = plane_size * sqrt(g.cov(0,0)); // spread along x-axis
+      m.scale.y = plane_size * sqrt(g.cov(1,1)); // spread along y-axis
       m.scale.z = thickness;
+    //   m.scale.z = sqrt(g.cov(2,2)); // spread along z-axis
 
-      float k = 10.0f;
-      float v = float(g.count) / (float(g.count) + k);
-
-      m.color.r = v;
-      m.color.g = 1.0f - std::fabs(v - 0.5f) * 2.0f;
-      m.color.b = 1.0f - v;
+      m.color.r = std::get<0>(color);
+      m.color.g = std::get<1>(color);
+      m.color.b = std::get<2>(color);
       m.color.a = 0.8f;
 
       m.lifetime = rclcpp::Duration(0, 0);
@@ -253,7 +258,9 @@ private:
   visualization_msgs::msg::Marker makeLineMarker(
       const gauss_ivox_mapping::GaussianPrimitive& g,
       int id,
-      const rclcpp::Time& stamp) const
+      const rclcpp::Time& stamp,
+      std::tuple<float,float,float>& color
+    ) const
   {
       visualization_msgs::msg::Marker m;
 
@@ -286,13 +293,10 @@ private:
       m.scale.y = 0.05;     // shaft diameter
       m.scale.z = 0.1;      // head diameter
 
-      float k = 10.0f;
-      float v = float(g.count) / (float(g.count) + k);
-
-      m.color.r = 1.0f;
-      m.color.g = v;
-      m.color.b = 0.0f;
-      m.color.a = 0.9f;
+      m.color.r = std::get<0>(color);
+      m.color.g = std::get<1>(color);
+      m.color.b = std::get<2>(color);
+      m.color.a = 0.8f;
 
       m.lifetime = rclcpp::Duration(0, 0);
 
@@ -302,7 +306,9 @@ private:
   visualization_msgs::msg::Marker makeVolumeMarker(
       const gauss_ivox_mapping::GaussianPrimitive& g,
       int id,
-      const rclcpp::Time& stamp) const
+      const rclcpp::Time& stamp,
+      std::tuple<float,float,float>& color
+    ) const
   {
       visualization_msgs::msg::Marker m;
 
@@ -342,13 +348,10 @@ private:
       m.scale.y = 2.0 * k_sigma * std::sqrt(evals(1));
       m.scale.z = 2.0 * k_sigma * std::sqrt(evals(2));
 
-      float k = 10.0f;
-      float v = float(g.count) / (float(g.count) + k);
-
-      m.color.r = v;
-      m.color.g = 1.0f - std::fabs(v - 0.5f) * 2.0f;
-      m.color.b = 1.0f - v;
-      m.color.a = 0.7f;
+      m.color.r = std::get<0>(color);
+      m.color.g = std::get<1>(color);
+      m.color.b = std::get<2>(color);
+      m.color.a = 0.8f;
 
       m.lifetime = rclcpp::Duration(0, 0);
 
@@ -375,6 +378,11 @@ private:
           }
           auto [r,g,b] = parent_colors[root];
 
+          gauss_ivox_mapping::Point voxel_center_;
+          voxel_center_[0] = (key.x() + 0.5) * voxel_size;
+          voxel_center_[1] = (key.y() + 0.5) * voxel_size;
+          voxel_center_[2] = (key.z() + 0.5) * voxel_size;
+
           // --- Voxel cube ---
           visualization_msgs::msg::Marker m;
           m.header.frame_id = "map";
@@ -383,9 +391,9 @@ private:
           m.id = id++;
           m.type = visualization_msgs::msg::Marker::CUBE;
           m.action = visualization_msgs::msg::Marker::ADD;
-          m.pose.position.x = node->voxel_center_[0];
-          m.pose.position.y = node->voxel_center_[1];
-          m.pose.position.z = node->voxel_center_[2];
+          m.pose.position.x = voxel_center_[0];
+          m.pose.position.y = voxel_center_[1];
+          m.pose.position.z = voxel_center_[2];
           m.pose.orientation.w = 1.0;
           m.scale.x = voxel_size;
           m.scale.y = voxel_size;
