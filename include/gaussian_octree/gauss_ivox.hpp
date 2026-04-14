@@ -51,7 +51,7 @@ struct pointWithCov
 
 enum class PrimitiveType {
     UNKNOWN,
-    LINE,
+    LINE, // --- To-Do IGNORE ---
     PLANE,
     VOLUME
 };
@@ -59,7 +59,7 @@ enum class PrimitiveType {
 struct GaussianPrimitive
 {
     // --- Core Gaussian ---
-    Point mean = Point::Zero();
+    Point mean = Point::Zero(); // world coordinates mean
     Mat3  cov  = Mat3::Zero();
     PrimitiveType type = PrimitiveType::UNKNOWN;
 
@@ -67,11 +67,8 @@ struct GaussianPrimitive
     int main_dir; // 0=z dominant, 1=y dominant, 2=x dominant
     Point n_vec;       // Plane normal vector
     Scalar d;          // Plane offset
+    Point param;       // [a, b, d] plane coefficients in dominant axis form
     Mat3 plane_cov = Mat3::Zero();
-
-    // --- Line parametric form (Plücker-like simplified) ---
-    Point direction;
-    Mat3 line_cov = Mat3::Zero();
 
     // --- Incremental stats (Scatter Matrix) ---
     Scalar xx = 0, yy = 0, zz = 0;
@@ -110,6 +107,8 @@ struct GaussianPrimitive
         y += ny_new;
         z += nz_new;
         count += other.count;
+
+        mean = (mean * (count - other.count) + other.mean * other.count) / count; // Update mean for merged primitive
     }
 };
 
@@ -121,19 +120,12 @@ public:
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
     GaussPtr gauss_ptr;
     UnionFindNode *rootNode;
+    Point voxel_center; // Center of the voxel for relative point storage
+    std::atomic<size_t> points_since_update = 0;
     
-    // We store points until the first initGeometry(), then use incremental calculation.
-    std::vector<pointWithCov> buffer_points; 
-    
-    bool init_node = false;
-    Scalar voxel_center[3];
-
-    UnionFindNode(const Eigen::Vector3i& key, Scalar voxel_sz) {
+    UnionFindNode(const Point& center) : voxel_center(center) {
         gauss_ptr = std::make_shared<GaussianPrimitive>();
         rootNode = this;
-        voxel_center[0] = (key.x() + 0.5) * voxel_sz;
-        voxel_center[1] = (key.y() + 0.5) * voxel_sz;
-        voxel_center[2] = (key.z() + 0.5) * voxel_sz;
     }
 
     // Path Compression for DSU
@@ -145,8 +137,15 @@ public:
 
 class GaussianIVox {
 public:
-    GaussianIVox(Scalar v_sz, std::size_t upd_thresh) 
-        : v_size_(v_sz), inv_v_size_(1.0 / v_sz), update_threshold_(upd_thresh) { }
+
+    GaussianIVox(Scalar v_sz, 
+                std::size_t upd_thresh, 
+                Scalar planarity_thresh = 0.01, 
+                Scalar chi_square_thresh = 7.815,
+                Scalar sensor_noise = 0.01) 
+        : v_size_(v_sz), inv_v_size_(1.0 / v_sz), update_threshold_(upd_thresh),
+          planarity_threshold_(planarity_thresh), chi_square_threshold_(chi_square_thresh), 
+          noise_(sensor_noise) { }
 
     ~GaussianIVox() {
         for (auto& pair : map_) {
@@ -161,30 +160,31 @@ public:
     void update(const pointWithCov& pv) {
         Eigen::Vector3i key = (pv.point * inv_v_size_).array().floor().cast<int>();
 
+        Point voxel_center;
+        voxel_center[0] = (key.x() + 0.5) * v_size_;
+        voxel_center[1] = (key.y() + 0.5) * v_size_;
+        voxel_center[2] = (key.z() + 0.5) * v_size_;
+        
         UnionFindNode* node = nullptr;
         {
             std::unique_lock<std::shared_mutex> lock(map_mtx_);
             auto it = map_.find(key);
             if (it == map_.end()) {
-                node = new UnionFindNode(key, v_size_);
+                node = new UnionFindNode(voxel_center);
                 map_[key] = node;
             } else {
                 node = it->second;
             }
         }
 
-        // Always operate on the root for DSU consistency
         UnionFindNode* root = node->find();
-        root->buffer_points.push_back(pv);
+        root->gauss_ptr->addPoint(pv.point - voxel_center); // Store points relative to voxel center for better numerical stability
+        root->points_since_update++;
 
-        // Trigger geometry update if threshold reached
-        if (root->buffer_points.size() >= update_threshold_) {
-            if (!root->init_node) {
-                initGeometry(root);
-            } else {
-                updateGeometry(root, key);
-            }
-            root->buffer_points.clear(); // Clear buffer to save memory
+        // Trigger geometry update incrementally
+        if (root->points_since_update >= update_threshold_) {
+            computeGeometry(root);
+            checkNeighbors(root, key);
         }
     }
 
@@ -219,57 +219,46 @@ public:
         return result;
     }
 
-// private:
     /**
-     * @brief Initial Gaussian Fitting and Eigen Decomposition
+     * @brief Gaussian Fitting and Eigen Decomposition
      */
-    void initGeometry(UnionFindNode* node) {
-        auto& g = node->gauss_ptr;
+    void computeGeometry(UnionFindNode* node) {
 
-        // Incremental Summation (compute mean & scatter)
-        for (const auto& pv : node->buffer_points) {
-            g->count++;
-            g->x  += pv.point[0]; g->y  += pv.point[1]; g->z  += pv.point[2];
-            g->xx += pv.point[0]*pv.point[0]; g->yy += pv.point[1]*pv.point[1]; g->zz += pv.point[2]*pv.point[2];
-            g->xy += pv.point[0]*pv.point[1]; g->xz += pv.point[0]*pv.point[2]; g->yz += pv.point[1]*pv.point[2];
-        }
+        auto& g = node->gauss_ptr;
+        if (g->count < 5) return;
 
         Scalar n = static_cast<Scalar>(g->count);
-        g->mean << g->x/n, g->y/n, g->z/n;
 
-        // Covariance / scatter matrix
-        g->cov << g->xx/n - (g->x/n)*(g->x/n), g->xy/n - (g->x/n)*(g->y/n), g->xz/n - (g->x/n)*(g->z/n),
-                g->xy/n - (g->x/n)*(g->y/n), g->yy/n - (g->y/n)*(g->y/n), g->yz/n - (g->y/n)*(g->z/n),
-                g->xz/n - (g->x/n)*(g->z/n), g->yz/n - (g->y/n)*(g->z/n), g->zz/n - (g->z/n)*(g->z/n);
+        // Recovery: World Mean = Local Mean + Voxel Center
+        g->mean << (g->x / n) + node->voxel_center.x(),
+                    (g->y / n) + node->voxel_center.y(),
+                    (g->z / n) + node->voxel_center.z();
 
-        // Eigen decomposition for shape analysis
+        // Unbiased covariance estimation using the scatter matrix and mean
+        Scalar inv = 1.0 / (n - 1); // Sample covariance normalization
+
+        Scalar mx = g->x / n;
+        Scalar my = g->y / n;
+        Scalar mz = g->z / n;
+
+        g->cov <<
+            (g->xx - n*mx*mx) * inv, (g->xy - n*mx*my) * inv, (g->xz - n*mx*mz) * inv,
+            (g->xy - n*mx*my) * inv, (g->yy - n*my*my) * inv, (g->yz - n*my*mz) * inv,
+            (g->xz - n*mx*mz) * inv, (g->yz - n*my*mz) * inv, (g->zz - n*mz*mz) * inv;
+
         Eigen::SelfAdjointEigenSolver<Mat3> es(g->cov);
         Point evals = es.eigenvalues();
-
-        Scalar l0 = evals(0);
-        Scalar l1 = evals(1);
-        Scalar l2 = evals(2);
-
-        Scalar linearity  = (l2 - l1) / l2;
-        Scalar planarity  = (l1 - l0) / l2;
-        Scalar scattering = l0 / l2;
+        
+        // PCA classification
+        Scalar l0 = std::max(evals(0), 0.0);
 
         // Primitive classification
-        if (planarity > linearity && planarity > scattering) {
+        // if (l0 < planarity_threshold_) {
+        if (true) { // --- For now, keep all as planes for debugging purposes ---
             g->type = PrimitiveType::PLANE;
 
-            Point evecMin = es.eigenvectors().col(0);
-            if(!solvePlaneAdjugate(g, evals, evecMin))
+            if(!solvePlaneAdjugate(node, evals, es.eigenvectors().col(0)))
                 g->type = PrimitiveType::UNKNOWN; // Degenerate case, keep as UNKNOWN
-        }
-        else if (linearity > planarity && linearity > scattering) {
-            g->type = PrimitiveType::LINE;
-
-            // Line direction: eigenvector of largest eigenvalue
-            Point evecMax = es.eigenvectors().col(2);
-            g->direction = evecMax.normalized();
-            Mat3 P = Mat3::Identity() - g->direction * g->direction.transpose();  // projector orthogonal to line
-            g->line_cov = P * g->cov * P;                                         // uncertainty orthogonal to line
         }
         else {
             g->type = PrimitiveType::VOLUME;
@@ -277,75 +266,56 @@ public:
             // For volumes, nothing extra needed — mean and cov already store 3D Gaussian
         }
 
-        node->init_node = true;
+        node->points_since_update = 0;
     }
 
-    /**
-     * @brief Re-fits plane and checks for neighbor merging (DSU Union)
-     */
-    void updateGeometry(UnionFindNode* node, Eigen::Vector3i& key) {
-        initGeometry(node); // Update internal stats first
-
-        // Neighbor Search for Merging (DSU)
+    void checkNeighbors(UnionFindNode* root, const Eigen::Vector3i& key) {
+        
+        // 6-Neighbor Search for Merging (DSU)
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
         int offsets[6][3] = {{-1,0,0}, {1,0,0}, {0,-1,0}, {0,1,0}, {0,0,1}, {0,0,-1}};
-        
+
         for (auto& off : offsets) {
             Eigen::Vector3i neighbor_key(key.x() + off[0], key.y() + off[1], key.z() + off[2]);
             auto it = map_.find(neighbor_key);
             if (it != map_.end()) {
                 UnionFindNode* neighbor_root = it->second->find();
-                if (neighbor_root != node) {
-                    checkAndMerge(node, neighbor_root, v_size_);
-                }
+                if (neighbor_root != root) tryMerge(root, neighbor_root);
             }
         }
     }
 
-    void checkAndMerge(UnionFindNode* root_a, UnionFindNode* root_b, Scalar &voxel_size) {
-        GaussPtr ga = root_a->gauss_ptr;
-        GaussPtr gb = root_b->gauss_ptr;
+    void tryMerge(UnionFindNode* a, UnionFindNode* b) {
+
+        GaussPtr ga = a->gauss_ptr;
+        GaussPtr gb = b->gauss_ptr;
 
         // Only merge same type primitives
-        if (ga->type != gb->type) return;
+        if (ga->type != gb->type || ga->type == PrimitiveType::UNKNOWN) return;
 
-        bool can_merge = false;
-
+        bool merge = false;
         switch (ga->type) {
             case PrimitiveType::PLANE: {
-                // --- Check normal alignment ---
-                Scalar cos_theta = ga->n_vec.dot(gb->n_vec);
-                cos_theta = std::clamp(cos_theta, Scalar(-1.0), Scalar(1.0));
-                Scalar angle = std::acos(cos_theta); // radians
-                constexpr Scalar max_angle = 5.0 * M_PI / 180.0; // 5 degrees
-                if (angle > max_angle) break;
+                // --- Mahalanobis distance for Plane similarity ---
+                if(ga->main_dir != gb->main_dir) break;
 
-                // --- Check plane distance along normal ---
-                Point diff = gb->mean - ga->mean;
-                Scalar dist = std::abs(diff.dot(ga->n_vec));
-                Scalar max_dist = voxel_size; // threshold can be tuned
-                if (dist > max_dist) break;
-                    can_merge = true;
+                if (ga->n_vec.dot(gb->n_vec) < 0) {
+                    gb->param *= -1.0;
+                }
+                
+                // (Bayesian style)
+                Eigen::Vector3d delta_pi = ga->param - gb->param; 
 
-                break;
-            }
+                // Add a regularization term to the sum of covariances
+                // This represents the uncertainty of the "link" between two voxels.
+                Mat3 cov_sum = ga->plane_cov + gb->plane_cov;
+                cov_sum.diagonal().array() += noise_*noise_; // regularization floor
 
-            case PrimitiveType::LINE: {
-                // --- Angle between line directions ---
-                Scalar cos_angle = ga->direction.dot(gb->direction);
-                cos_angle = std::clamp(cos_angle, Scalar(-1.0), Scalar(1.0));
-                Scalar angle = std::acos(cos_angle);
-                constexpr Scalar max_angle = 5.0 * M_PI / 180.0; // 5 degrees
-                if (angle > max_angle) break;
+                Scalar m_dist_sq = delta_pi.transpose() * cov_sum.inverse() * delta_pi;
 
-                // --- Distance between lines ---
-                Point delta = gb->mean - ga->mean;
-                Point cross_dir = ga->direction.cross(delta);
-                Scalar dist = cross_dir.norm();
-                Scalar max_dist = voxel_size; // threshold can be tuned
-                if (dist > max_dist) break;
+                if (m_dist_sq < chi_square_threshold_)
+                    merge = true;
 
-                can_merge = true;
                 break;
             }
 
@@ -353,72 +323,62 @@ public:
                 // --- Mahalanobis distance on means for Gaussian similarity ---
                 Point diff = gb->mean - ga->mean;
                 Mat3 cov_sum = ga->cov + gb->cov;
-                cov_sum += Mat3::Identity() * 1e-6; // regularization
+                cov_sum.diagonal().array() += noise_*noise_; // regularization floor
                 if (cov_sum.determinant() < 1e-12) break;
 
-                Scalar m_dist = std::sqrt(diff.transpose() * cov_sum.inverse() * diff);
-                Scalar max_mdist = voxel_size; // threshold can be tuned
-                if (m_dist > max_mdist) break;
+                Scalar m_dist_sq = diff.transpose() * cov_sum.inverse() * diff;
 
-                can_merge = true;
+                if (m_dist_sq < chi_square_threshold_) 
+                    merge = true;
+
                 break;
             }
+
+            default:
+                break;
         }
 
-        if (!can_merge) return;
+        if(!merge) return;
 
-        // Union operation
-        root_b->rootNode = root_a;
+        b->rootNode = a; // DSU Union: root of b points to root of a
 
-        // Merge Gaussian statistics (all types use same formula)
-        int nA = ga->count;
-        int nB = gb->count;
-        int n  = nA + nB;
+        Point delta = b->voxel_center - a->voxel_center; // spatial shift
+        ga->mergeSums(*(gb), delta); // Merge incremental sums for accurate geometry update
 
-        // Merge means
-        Point mean = (nA * ga->mean + nB * gb->mean) / n;
+        switch (ga->type) {
+            case PrimitiveType::PLANE: {
+                // VoxelMap++ merging logic: weighted average of plane parameters based on covariance "confidence"
+                Scalar trA = ga->plane_cov.trace();
+                Scalar trB = gb->plane_cov.trace();
 
-        // Merge covariances (scatter matrix update)
-        Mat3 cov =
-            (nA * (ga->cov + (ga->mean - mean) * (ga->mean - mean).transpose()) +
-            nB * (gb->cov + (gb->mean - mean) * (gb->mean - mean).transpose())) / n;
+                Scalar wA = trB / (trA + trB);
+                Scalar wB = trA / (trA + trB);
+                
+                ga->param = wA * ga->param + wB * gb->param;
+                ga->plane_cov = wA * wA * ga->plane_cov + wB * wB * gb->plane_cov;
 
-        ga->mean  = mean;
-        ga->cov   = cov;
-        ga->count = n;
+                // Re-build plane normal from merged parameters
+                switch(ga->main_dir) {
+                    case 0: ga->n_vec << ga->param[0], ga->param[1], 1.0; break; // z dominant
+                    case 1: ga->n_vec << ga->param[0], 1.0, ga->param[1]; break; // y dominant
+                    case 2: ga->n_vec << 1.0, ga->param[0], ga->param[1]; break; // x dominant
+                    default: break; // should never happen
+                }
+                ga->n_vec.normalize();
+                ga->d = -ga->n_vec.dot(ga->mean); // world-frame plane offset
+                break;
+            }
+            
+            case PrimitiveType::VOLUME: {
+                computeGeometry(a); // Recompute mean and covariance for merged volume
+                break;
+            }
 
-        // Merge additional type-specific descriptors
-        if (ga->type == PrimitiveType::PLANE) {
-            Scalar cA = gb->plane_cov.norm() /
-                        (ga->plane_cov.norm() +
-                            gb->plane_cov.norm());
-            Scalar cB = ga->plane_cov.norm() /
-                        (ga->plane_cov.norm() +
-                            gb->plane_cov.norm());
-            ga->n_vec = cA * ga->n_vec +
-                        cB * gb->n_vec;
-            ga->n_vec.normalize();
-        } else if (ga->type == PrimitiveType::LINE) {
-            Mat3 covA_perp = ga->line_cov - ga->direction * (ga->direction.transpose() * ga->line_cov * ga->direction) * ga->direction.transpose();
-            Mat3 covB_perp = gb->line_cov - gb->direction * (gb->direction.transpose() * gb->line_cov * gb->direction) * gb->direction.transpose();
-
-            Scalar wA = 1.0 / covA_perp.norm();
-            Scalar wB = 1.0 / covB_perp.norm();
-
-            ga->direction = (wA * ga->direction + wB * gb->direction).normalized();
-
-            Point merged_mean;
-            Point dir = ga->direction; // already merged
-            Scalar tA = dir.dot(ga->mean);
-            Scalar tB = dir.dot(gb->mean);
-            merged_mean = (nA * (dir * tA) + nB * (dir * tB)) / (nA + nB);
-            ga->mean = merged_mean; // ensure mean lies on merged line
-
-            ga->line_cov = (nA * ga->line_cov + nB * gb->line_cov) / (nA + nB);
+            default:
+                break;
         }
 
-        // Remove primitive from non-root
-        root_b->gauss_ptr.reset(); 
+        b->gauss_ptr.reset(); // Clear merged primitive to save memory, only root holds valid Gaussian
     }
 
     /**
@@ -429,13 +389,15 @@ public:
     * @return false if degenerate
     */
     bool solvePlaneAdjugate(
-        GaussPtr& g,
+        UnionFindNode* node,
         const Point& evals,
         const Point& evecMin
     ) {
         Mat3 A, A_star;
         Point E;
         Scalar detA = 0.0;
+
+        auto g = node->gauss_ptr;
 
         Scalar n = static_cast<Scalar>(g->count);
         Scalar xx = g->xx, yy = g->yy, zz = g->zz;
@@ -486,39 +448,50 @@ public:
             case 0: g->n_vec << param[0], param[1], 1.0; break; // z dominant
             case 1: g->n_vec << param[0], 1.0, param[1]; break; // y dominant
             case 2: g->n_vec << 1.0, param[0], param[1]; break; // x dominant
+            default: return false; // should never happen
         }
 
         // Normalize plane
-        Scalar norm = std::sqrt(param[0]*param[0] + param[1]*param[1] + 1.0); // include implicit axis
-        if (norm < 1e-9) return false;
+        g->n_vec.normalize();
 
-        g->n_vec[0] /= norm;
-        g->n_vec[1] /= norm;
-        g->n_vec[2] /= norm;
+        // Save plane offset 
+        g->d = -g->n_vec.dot(g->mean); // world-frame plane offset
 
         // --- Compute plane covariance ---
-        Scalar l0 = evals(0); // smallest
-        Scalar l1 = evals(1);
-        Scalar l2 = evals(2);
+        // Calculate the variance of the residuals (sigma^2)
+        // l0 is the mean squared error; we multiply by n to get the sum of squares
+        Scalar residual_var = (evals(0) * n) / std::max(n - 3.0, 1.0);
 
-        // Stability guards
-        Scalar eps = 1e-9;
-        Scalar gap1 = std::max(l1 - l0, eps);
-        Scalar gap2 = std::max(l2 - l0, eps);
+        // Add Sensor Noise Floor (Hardware Limit)
+        // VoxelMap++ suggests that the hardware noise is a constant offset 
+        // to the residual variance.
+        constexpr Scalar kSensorNoise = 0.0004; // (0.02m)^2
+        Scalar total_sigma2 = residual_var + kSensorNoise;
 
-        // Projector orthogonal to normal
-        Mat3 P = Mat3::Identity() - g->n_vec * g->n_vec.transpose();
+        // The covariance of the solved parameters [a, b, d] is sigma^2 * A^-1
+        // We already have A_star (adjugate) and detA.
+        Mat3 C_param = (A_star / detA) * total_sigma2;
 
-        // Directional uncertainty (principal approximation)
-        Scalar sigma_dir = l0 / (gap1 + gap2);
-        Mat3 cov_dir = sigma_dir * P;
+        Mat3 T = Mat3::Identity();
+        switch(g->main_dir) {
+            case 0: 
+                T(2,0) = -node->voxel_center.x(); T(2,1) = -node->voxel_center.y(); 
+                g->param[0] = g->n_vec[0]; g->param[1] = g->n_vec[1]; g->param[2] = g->d; // Store plane parameters for merging logic
+                break;
+            case 1: 
+                T(2,0) = -node->voxel_center.x(); T(2,1) = -node->voxel_center.z(); 
+                g->param[0] = g->n_vec[0]; g->param[1] = g->n_vec[2]; g->param[2] = g->d;
+                break;
+            case 2: 
+                T(2,0) = -node->voxel_center.y(); T(2,1) = -node->voxel_center.z(); 
+                g->param[0] = g->n_vec[1]; g->param[1] = g->n_vec[2]; g->param[2] = g->d;
+                break;
+            default:
+                return false; // should never happen
+        }
 
-        // Offset uncertainty (distance along normal)
-        // Standard Error + Sensor Noise Floor
-        Scalar sigma_d = (l0 / std::max(n, 1.0)) + 0.0004; // 0.0004 = (0.02m)^2
-
-        // Combine into plane covariance (normal + offset coupling)
-        g->plane_cov = cov_dir + sigma_d * (g->n_vec * g->n_vec.transpose());
+        // This is the covariance of [a, b, d_world]
+        g->plane_cov = T * C_param * T.transpose();
 
         return true;
     }
@@ -527,6 +500,9 @@ public:
     std::unordered_map<Eigen::Vector3i, UnionFindNode*, HashVec3i> map_;
     Scalar v_size_, inv_v_size_;
     std::size_t update_threshold_;
+    Scalar planarity_threshold_;  // Tunable threshold for plane classification
+    Scalar chi_square_threshold_; // Tunable threshold for plane merging
+    Scalar noise_;                // Sensor noise floor for covariance estimation
 };
 
 } // namespace gauss_ivox_mapping
