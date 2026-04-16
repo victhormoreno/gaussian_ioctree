@@ -14,11 +14,20 @@ using Scalar = double;
 using Point  = Eigen::Matrix<Scalar, 3, 1>;
 using Mat3   = Eigen::Matrix<Scalar, 3, 3>;
 
+/**
+ * @brief Combines two hash values using FNV-like mixing.
+ * @param seed Initial hash seed
+ * @param v Value to combine
+ */
 inline size_t hash_combine(size_t seed, size_t v) {
     return seed ^ (v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
 }
 
 struct HashVec3i {
+    /**
+     * @brief Hash function for 3D integer vectors
+     * @param v 3D vector to hash
+     */
     size_t operator()(const Eigen::Vector3i& v) const {
         size_t seed = 0;
         seed = hash_combine(seed, std::hash<int>()(v[0]));
@@ -28,6 +37,11 @@ struct HashVec3i {
     }
 };
 
+/**
+ * @brief Computes the adjugate (adjoint) matrix of a 3x3 matrix
+ * @param A Input 3x3 matrix
+ * @param adj Output adjugate matrix
+ */
 inline void adjugateM3D(const Mat3& A, Mat3& adj) {
     adj(0,0) =  A(1,1)*A(2,2) - A(1,2)*A(2,1);
     adj(0,1) = -A(0,1)*A(2,2) + A(0,2)*A(2,1);
@@ -41,13 +55,6 @@ inline void adjugateM3D(const Mat3& A, Mat3& adj) {
     adj(2,1) = -A(0,0)*A(2,1) + A(0,1)*A(2,0);
     adj(2,2) =  A(0,0)*A(1,1) - A(0,1)*A(1,0);
 }
-
-/*** 3D Point with Covariance ***/
-struct pointWithCov
-{
-    Point point;
-    Mat3 cov;
-};
 
 enum class PrimitiveType {
     UNKNOWN,
@@ -65,9 +72,7 @@ struct GaussianPrimitive
 
     // --- Plane parametric form ax + by + cz + d = 0 ---
     int main_dir; // 0=z dominant, 1=y dominant, 2=x dominant
-    Point n_vec;       // Plane normal vector
-    Scalar d;          // Plane offset
-    Point param;       // [a, b, d] plane coefficients in dominant axis form
+    Point param;  // [a, b, d] plane parametrization in dominant axis form
     Mat3 plane_cov = Mat3::Zero();
 
     // --- Incremental stats (Scatter Matrix) ---
@@ -76,7 +81,10 @@ struct GaussianPrimitive
     Scalar x = 0, y = 0, z = 0;
     int count = 0;
 
-    // Updates sums immediately upon point arrival
+    /**
+     * @brief Updates incremental sums with a new point
+     * @param p Point to add to the Gaussian primitive
+     */
     void addPoint(const Point& p) {
         count++;
         x += p.x(); y += p.y(); z += p.z();
@@ -84,7 +92,11 @@ struct GaussianPrimitive
         xy += p.x() * p.y(); xz += p.x() * p.z(); yz += p.y() * p.z();
     }
 
-    // Merges sums from another primitive during DSU Union
+    /**
+     * @brief Merges incremental sums from another primitive using parallel axis theorem
+     * @param other Another Gaussian primitive to merge
+     * @param delta Spatial offset between voxel centers
+     */
     void mergeSums(const GaussianPrimitive& other, const Point& delta) {
         Scalar n2 = static_cast<Scalar>(other.count);
 
@@ -107,13 +119,10 @@ struct GaussianPrimitive
         y += ny_new;
         z += nz_new;
         count += other.count;
-
-        mean = (mean * (count - other.count) + other.mean * other.count) / count; // Update mean for merged primitive
     }
 };
 
 using GaussPtr = std::shared_ptr<GaussianPrimitive>;
-using GaussConstPtr = const std::shared_ptr<GaussianPrimitive>;
 
 class UnionFindNode {
 public:
@@ -123,12 +132,18 @@ public:
     Point voxel_center; // Center of the voxel for relative point storage
     std::atomic<size_t> points_since_update = 0;
     
+    /**
+     * @brief Constructs a union-find node for a voxel
+     * @param center Center coordinates of the voxel
+     */
     UnionFindNode(const Point& center) : voxel_center(center) {
         gauss_ptr = std::make_shared<GaussianPrimitive>();
         rootNode = this;
     }
 
-    // Path Compression for DSU
+    /**
+     * @brief Finds root node with path compression
+     */
     UnionFindNode* find() {
         if (rootNode == this) return this;
         return rootNode = rootNode->find();
@@ -138,6 +153,14 @@ public:
 class GaussianIVox {
 public:
 
+    /**
+     * @brief Constructs a GaussianIVox map with specified parameters
+     * @param v_sz Voxel size (resolution)
+     * @param upd_thresh Update threshold (points to accumulate before geometry recomputation)
+     * @param planarity_thresh Threshold for plane vs volume classification
+     * @param chi_square_thresh Mahalanobis distance threshold for merging
+     * @param sensor_noise Sensor noise floor for covariance regularization
+     */
     GaussianIVox(Scalar v_sz, 
                 std::size_t upd_thresh, 
                 Scalar planarity_thresh = 0.01, 
@@ -147,6 +170,9 @@ public:
           planarity_threshold_(planarity_thresh), chi_square_threshold_(chi_square_thresh), 
           noise_(sensor_noise) { }
 
+    /**
+     * @brief Destructor: cleans up all union-find nodes
+     */
     ~GaussianIVox() {
         for (auto& pair : map_) {
             delete pair.second;
@@ -155,10 +181,11 @@ public:
     }
 
     /**
-     * @brief Updates the map with a new point. Handles DSU merging and geometry.
+     * @brief Updates the map with a new point, triggers geometry computation and neighbor merging
+     * @param point Point to insert into the map (world-frame coordinates)
      */
-    void update(const pointWithCov& pv) {
-        Eigen::Vector3i key = (pv.point * inv_v_size_).array().floor().cast<int>();
+    void update(const Point& point) {
+        Eigen::Vector3i key = (point * inv_v_size_).array().floor().cast<int>();
 
         Point voxel_center;
         voxel_center[0] = (key.x() + 0.5) * v_size_;
@@ -178,7 +205,7 @@ public:
         }
 
         UnionFindNode* root = node->find();
-        root->gauss_ptr->addPoint(pv.point - voxel_center); // Store points relative to voxel center for better numerical stability
+        root->gauss_ptr->addPoint(point - voxel_center); // Store points relative to voxel center for better numerical stability
         root->points_since_update++;
 
         // Trigger geometry update incrementally
@@ -189,7 +216,29 @@ public:
     }
 
     /**
-     * @brief Thread-safe retrieval of all unique gaussians in the map
+     * @brief Retrieves the Gaussian primitive at a given point location
+     * @param p Query point in world coordinates
+     * @return Shared pointer to the root Gaussian primitive, or nullptr if not found
+     */
+    GaussPtr getPrimitiveAtPoint(const Point& p) const
+    {
+        Eigen::Vector3i key = (p * inv_v_size_).array().floor().cast<int>();
+
+        std::shared_lock<std::shared_mutex> lock(map_mtx_);
+
+        auto it = map_.find(key);
+        if (it == map_.end())
+            return nullptr;
+
+        UnionFindNode* node = it->second;
+        UnionFindNode* root = node->find();
+
+        return root->gauss_ptr;
+    }
+
+    /**
+     * @brief Thread-safe retrieval of all unique root Gaussian primitives
+     * @return Vector of shared pointers to all root Gaussians in the map
      */
     std::vector<GaussPtr> getGaussians() const {
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
@@ -202,7 +251,9 @@ public:
     }
 
     /**
-     * @brief Thread-safe retrieval of selected type gaussians
+     * @brief Thread-safe retrieval of Gaussians filtered by primitive type
+     * @param type Primitive type to filter (PLANE, VOLUME, etc.)
+     * @return Vector of shared pointers to Gaussians of the specified type
      */
     std::vector<GaussPtr> getByType(PrimitiveType type) const {
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
@@ -220,7 +271,24 @@ public:
     }
 
     /**
-     * @brief Gaussian Fitting and Eigen Decomposition
+     * @brief Constructs the plane normal vector based on dominant axis
+     * @param p Plane parameters [a, b, d] in dominant axis form
+     * @param main_dir Dominant axis (0=z, 1=y, 2=x)
+     * @return Normal vector in form [x, y, z] == [a, b, c]
+     */
+    Point buildNormalVector(const Point& p, int main_dir) {
+        Point w;
+        switch (main_dir) {
+            case 0: w << p[0], p[1], 1.0; break;
+            case 1: w << p[0], 1.0, p[1]; break;
+            case 2: w << 1.0, p[0], p[1]; break;
+        }
+        return w;
+    }
+
+    /**
+     * @brief Computes Gaussian geometry from scatter matrix, classifies primitive type via PCA
+     * @param node Union-find node containing the point statistics
      */
     void computeGeometry(UnionFindNode* node) {
 
@@ -269,6 +337,11 @@ public:
         node->points_since_update = 0;
     }
 
+    /**
+     * @brief Checks 6-neighbor voxels and attempts merging with same-type primitives
+     * @param root Root union-find node of current voxel
+     * @param key Voxel grid key of current location
+     */
     void checkNeighbors(UnionFindNode* root, const Eigen::Vector3i& key) {
         
         // 6-Neighbor Search for Merging (DSU)
@@ -285,6 +358,11 @@ public:
         }
     }
 
+    /**
+     * @brief Attempts to merge two primitives using Mahalanobis distance test
+     * @param a Root node of first primitive
+     * @param b Root node of second primitive
+     */
     void tryMerge(UnionFindNode* a, UnionFindNode* b) {
 
         GaussPtr ga = a->gauss_ptr;
@@ -299,10 +377,13 @@ public:
                 // --- Mahalanobis distance for Plane similarity ---
                 if(ga->main_dir != gb->main_dir) break;
 
-                if (ga->n_vec.dot(gb->n_vec) < 0) {
+                Point na = buildNormalVector(ga->param, ga->main_dir);
+                Point nb = buildNormalVector(gb->param, gb->main_dir);
+
+                if (na.dot(nb) < 0) {
                     gb->param *= -1.0;
                 }
-                
+
                 // (Bayesian style)
                 Eigen::Vector3d delta_pi = ga->param - gb->param; 
 
@@ -357,15 +438,6 @@ public:
                 ga->param = wA * ga->param + wB * gb->param;
                 ga->plane_cov = wA * wA * ga->plane_cov + wB * wB * gb->plane_cov;
 
-                // Re-build plane normal from merged parameters
-                switch(ga->main_dir) {
-                    case 0: ga->n_vec << ga->param[0], ga->param[1], 1.0; break; // z dominant
-                    case 1: ga->n_vec << ga->param[0], 1.0, ga->param[1]; break; // y dominant
-                    case 2: ga->n_vec << 1.0, ga->param[0], ga->param[1]; break; // x dominant
-                    default: break; // should never happen
-                }
-                ga->n_vec.normalize();
-                ga->d = -ga->n_vec.dot(ga->mean); // world-frame plane offset
                 break;
             }
             
@@ -382,12 +454,12 @@ public:
     }
 
     /**
-    * @brief Solve plane using adjugate method
-    *
-    * @param g                       : Gaussian pointer
-    * @param evecMin                 : smallest eigenvector (for stability choice)
-    * @return false if degenerate
-    */
+     * @brief Solves plane parameters using adjugate method, selects stable axis form
+     * @param node Union-find node containing point statistics
+     * @param evals Eigenvalues of covariance matrix
+     * @param evecMin Smallest eigenvector for axis selection
+     * @return true if plane solved successfully, false if degenerate
+     */
     bool solvePlaneAdjugate(
         UnionFindNode* node,
         const Point& evals,
@@ -443,19 +515,12 @@ public:
 
         Point param = (A_star * E) / detA;
 
-        // --- Convert to parameterization (a,b,c) + offset (d) ---
-        switch(g->main_dir) {
-            case 0: g->n_vec << param[0], param[1], 1.0; break; // z dominant
-            case 1: g->n_vec << param[0], 1.0, param[1]; break; // y dominant
-            case 2: g->n_vec << 1.0, param[0], param[1]; break; // x dominant
-            default: return false; // should never happen
-        }
+        // --- Transform plane offset to world-frame ---
+        Point n_vec = buildNormalVector(param, g->main_dir);
+        param[2] -= n_vec.dot(node->voxel_center);
 
-        // Normalize plane
-        g->n_vec.normalize();
-
-        // Save plane offset 
-        g->d = -g->n_vec.dot(g->mean); // world-frame plane offset
+        // Store dominant axis parameters [a, b, d_world] for merging logic
+        g->param = param; 
 
         // --- Compute plane covariance ---
         // Calculate the variance of the residuals (sigma^2)
@@ -465,7 +530,7 @@ public:
         // Add Sensor Noise Floor (Hardware Limit)
         // VoxelMap++ suggests that the hardware noise is a constant offset 
         // to the residual variance.
-        constexpr Scalar kSensorNoise = 0.0004; // (0.02m)^2
+        const Scalar kSensorNoise = noise_*noise_; 
         Scalar total_sigma2 = residual_var + kSensorNoise;
 
         // The covariance of the solved parameters [a, b, d] is sigma^2 * A^-1
@@ -476,15 +541,12 @@ public:
         switch(g->main_dir) {
             case 0: 
                 T(2,0) = -node->voxel_center.x(); T(2,1) = -node->voxel_center.y(); 
-                g->param[0] = g->n_vec[0]; g->param[1] = g->n_vec[1]; g->param[2] = g->d; // Store plane parameters for merging logic
                 break;
             case 1: 
                 T(2,0) = -node->voxel_center.x(); T(2,1) = -node->voxel_center.z(); 
-                g->param[0] = g->n_vec[0]; g->param[1] = g->n_vec[2]; g->param[2] = g->d;
                 break;
             case 2: 
                 T(2,0) = -node->voxel_center.y(); T(2,1) = -node->voxel_center.z(); 
-                g->param[0] = g->n_vec[1]; g->param[1] = g->n_vec[2]; g->param[2] = g->d;
                 break;
             default:
                 return false; // should never happen

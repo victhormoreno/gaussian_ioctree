@@ -105,18 +105,13 @@ private:
     pcl::PointCloud<PointType>::Ptr pc_ (std::make_shared<pcl::PointCloud<PointType>>());
     pcl::fromROSMsg(msg, *pc_);
 
-    // point covariance
-    const gauss_ivox_mapping::Mat3 p_cov = 0.001 * gauss_ivox_mapping::Mat3::Identity();
-    // const gauss_ivox_mapping::Mat3 P_curr = p_cov; // fixed eKF covariance
-
     auto tick = std::chrono::system_clock::now(); 
     for (const auto& p : pc_->points) {
-      gauss_ivox_mapping::pointWithCov pos;
-      pos.point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
+      gauss_ivox_mapping::Point point;
+      point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
                     static_cast<gauss_ivox_mapping::Scalar>(p.y),
                     static_cast<gauss_ivox_mapping::Scalar>(p.z);
-      pos.cov = p_cov;
-      ivox_->update(pos);
+      ivox_->update(point);
     }
     auto tack = std::chrono::system_clock::now();
 
@@ -147,33 +142,49 @@ private:
       std::mt19937 gen(12345); // fixed seed for consistent cluster colors
       std::uniform_real_distribution<float> dis(0.0f, 1.0f);
       std::unordered_map<gauss_ivox_mapping::UnionFindNode*, std::tuple<float,float,float>> parent_colors;
+      std::unordered_map<gauss_ivox_mapping::UnionFindNode*, std::vector<Eigen::Vector3i>> clusters;
 
-      int id = 0;
+      // Build clusters based on Union-Find parents and assign colors
       for (const auto& [key, node] : ivox.map_) {
-          auto* root = node->find();
+          auto root = node->find();
+          clusters[root].push_back(key);
           if (parent_colors.find(root) == parent_colors.end()) {
               parent_colors[root] = {dis(gen), dis(gen), dis(gen)};
           }
+      }
 
-          auto& gaus = node->gauss_ptr;
-          if (!gaus) continue; // if not root skip (will not have geometry)
+      // Visualize each voxel Gaussian primitive
+      int id = 0;
+      for (auto& [root, voxels] : clusters) {
 
-          visualization_msgs::msg::Marker m;
+          auto& gaus = root->gauss_ptr;
+          if (!gaus) continue; // safety check, should always have a Gaussian
 
-          switch (gaus->type) {
-              case gauss_ivox_mapping::PrimitiveType::PLANE:
-                  m = makePlaneMarker(*gaus, id++, stamp, parent_colors[root]);
-                  break;
+          for (const auto& key : voxels) {
 
-              case gauss_ivox_mapping::PrimitiveType::VOLUME:
-                  m = makeVolumeMarker(*gaus, id++, stamp, parent_colors[root]);
-                  break;
+            gauss_ivox_mapping::Point voxel_center;
+            voxel_center[0] = (key.x() + 0.5) * resolution_;
+            voxel_center[1] = (key.y() + 0.5) * resolution_;
+            voxel_center[2] = (key.z() + 0.5) * resolution_;
 
-              default:
-                  break;
-          }
+            visualization_msgs::msg::Marker m;
 
-          arr.markers.push_back(m);
+            switch (gaus->type) {
+                case gauss_ivox_mapping::PrimitiveType::PLANE:
+                    m = makePlaneMarker(*gaus, voxel_center, id++, stamp, parent_colors[root]);
+                    break;
+
+                case gauss_ivox_mapping::PrimitiveType::VOLUME:
+                    m = makeVolumeMarker(*gaus, id++, stamp, parent_colors[root]);
+                    break;
+
+                default:
+                    break;
+            }
+
+            arr.markers.push_back(m);
+        }
+
       }
       
       return arr;
@@ -181,18 +192,38 @@ private:
 
   visualization_msgs::msg::Marker makePlaneMarker(
       const gauss_ivox_mapping::GaussianPrimitive& g,
+      const gauss_ivox_mapping::Point& voxel_center,
       int id,
       const rclcpp::Time& stamp,
       std::tuple<float,float,float>& color) const
   {
+
+      using Point = gauss_ivox_mapping::Point;
+
       visualization_msgs::msg::Marker m;
 
-      const double plane_size = 1.0;
+      const double plane_size = resolution_;
       const double thickness = 0.002;
 
-      Eigen::Vector3d normal = g.n_vec;
-      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
+      auto buildOmega = [](const Point& p, int main_dir) {
+        Point w;
+        switch (main_dir) {
+            case 0: w << p[0], p[1], 1.0; break;
+            case 1: w << p[0], 1.0, p[1]; break;
+            case 2: w << 1.0, p[0], p[1]; break;
+        }
+        return w;
+      };
+
+      // Compute plane center and normal
+      Point normal = buildOmega(g.param, g.main_dir);
+      double norm2 = normal.squaredNorm();
+      Point p0 = voxel_center; 
+
+      Point p_plane = p0 - normal * (normal.dot(p0) + g.param[2]) / norm2;
+
       normal.normalize();
+      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
 
       Eigen::Vector3d z_axis = normal;
 
@@ -227,19 +258,21 @@ private:
       m.type = visualization_msgs::msg::Marker::CUBE;
       m.action = visualization_msgs::msg::Marker::ADD;
 
-      m.pose.position.x = g.mean.x();
-      m.pose.position.y = g.mean.y();
-      m.pose.position.z = g.mean.z();
+      m.pose.position.x = p_plane.x();
+      m.pose.position.y = p_plane.y();
+      m.pose.position.z = p_plane.z();
 
       m.pose.orientation.x = q.x();
       m.pose.orientation.y = q.y();
       m.pose.orientation.z = q.z();
       m.pose.orientation.w = q.w();
 
-      m.scale.x = plane_size * sqrt(g.cov(0,0)); // spread along x-axis
-      m.scale.y = plane_size * sqrt(g.cov(1,1)); // spread along y-axis
+      m.scale.x = plane_size; 
+      m.scale.y = plane_size;
       m.scale.z = thickness;
-    //   m.scale.z = sqrt(g.cov(2,2)); // spread along z-axis
+      // m.scale.x = plane_size * sqrt(g.cov(0,0)); // spread along x-axis
+      // m.scale.y = plane_size * sqrt(g.cov(1,1)); // spread along y-axis
+      // m.scale.z = sqrt(g.cov(2,2)); // spread along z-axis
 
       m.color.r = std::get<0>(color);
       m.color.g = std::get<1>(color);

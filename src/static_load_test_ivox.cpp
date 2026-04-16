@@ -109,10 +109,6 @@ private:
     if (!filtered_cloud_ || filtered_cloud_->empty())
       throw std::runtime_error("Filtered cloud is empty");
 
-    // point covariance
-    const gauss_ivox_mapping::Mat3 p_cov = 0.01 * gauss_ivox_mapping::Mat3::Identity();
-    // const gauss_ivox_mapping::Mat3 P_curr = p_cov;
-
     ivox_ = std::make_unique<gauss_ivox_mapping::GaussianIVox>(
       static_cast<gauss_ivox_mapping::Scalar>(resolution_),
       static_cast<std::size_t>(update_threshold_)
@@ -121,12 +117,11 @@ private:
     auto tick = std::chrono::system_clock::now(); 
     for (const auto& p : filtered_cloud_->points) {
       if (!std::isfinite(p.x) || !std::isfinite(p.y) || !std::isfinite(p.z)) continue;
-      gauss_ivox_mapping::pointWithCov pos;
-      pos.point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
+      gauss_ivox_mapping::Point point;
+      point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
                   static_cast<gauss_ivox_mapping::Scalar>(p.y),
                   static_cast<gauss_ivox_mapping::Scalar>(p.z);
-      pos.cov = p_cov;
-      ivox_->update(pos);
+      ivox_->update(point);
     }
     auto tack = std::chrono::system_clock::now();
 
@@ -204,14 +199,31 @@ private:
       int id,
       const rclcpp::Time& stamp) const
   {
+      using Point = gauss_ivox_mapping::Point;
+
       visualization_msgs::msg::Marker m;
 
       const double plane_size = 1.0;
       const double thickness  = 0.02;
 
-      Eigen::Vector3d normal = g.n_vec;
-      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
+      auto buildOmega = [](const Point& p, int main_dir) {
+        Point w;
+        switch (main_dir) {
+            case 0: w << p[0], p[1], 1.0; break;
+            case 1: w << p[0], 1.0, p[1]; break;
+            case 2: w << 1.0, p[0], p[1]; break;
+        }
+        return w;
+      };
+
+      Eigen::Vector3d normal = buildOmega(g.param, g.main_dir);
+      double norm2 = normal.squaredNorm();
+      Point p0 = g.mean;  // or voxel_center for grid alignment
+
+      Point p_plane = p0 - normal * (normal.dot(p0) + g.param[2]) / norm2;
+
       normal.normalize();
+      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
 
       Eigen::Vector3d z_axis = normal;
 
@@ -246,9 +258,9 @@ private:
       m.type = visualization_msgs::msg::Marker::CUBE;
       m.action = visualization_msgs::msg::Marker::ADD;
 
-      m.pose.position.x = g.mean.x();
-      m.pose.position.y = g.mean.y();
-      m.pose.position.z = g.mean.z();
+      m.pose.position.x = p_plane.x();
+      m.pose.position.y = p_plane.y();
+      m.pose.position.z = p_plane.z();
 
       m.pose.orientation.x = q.x();
       m.pose.orientation.y = q.y();
@@ -434,14 +446,31 @@ visualization_msgs::msg::MarkerArray makeGaussianMarkers(
       const rclcpp::Time& stamp,
       std::tuple<float,float,float>& color) const
   {
+      using Point = gauss_ivox_mapping::Point;
+
       visualization_msgs::msg::Marker m;
 
       const double plane_size = 2.0;
       const double thickness = 0.02;
 
-      Eigen::Vector3d normal = g.n_vec;
-      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
+      auto buildOmega = [](const Point& p, int main_dir) {
+        Point w;
+        switch (main_dir) {
+            case 0: w << p[0], p[1], 1.0; break;
+            case 1: w << p[0], 1.0, p[1]; break;
+            case 2: w << 1.0, p[0], p[1]; break;
+        }
+        return w;
+      };
+
+      Eigen::Vector3d normal = buildOmega(g.param, g.main_dir);
+      double norm2 = normal.squaredNorm();
+      Point p0 = g.mean;  // or voxel_center for grid alignment
+
+      Point p_plane = p0 - normal * (normal.dot(p0) + g.param[2]) / norm2;
+
       normal.normalize();
+      if (normal.norm() < 1e-6) normal = Eigen::Vector3d::UnitZ();
 
       Eigen::Vector3d z_axis = normal;
 
@@ -476,9 +505,9 @@ visualization_msgs::msg::MarkerArray makeGaussianMarkers(
       m.type = visualization_msgs::msg::Marker::CUBE;
       m.action = visualization_msgs::msg::Marker::ADD;
 
-      m.pose.position.x = g.mean.x();
-      m.pose.position.y = g.mean.y();
-      m.pose.position.z = g.mean.z();
+      m.pose.position.x = p_plane.x();
+      m.pose.position.y = p_plane.y();
+      m.pose.position.z = p_plane.z();
 
       m.pose.orientation.x = q.x();
       m.pose.orientation.y = q.y();
