@@ -1,4 +1,4 @@
-// real_time_test_ivox.cpp
+// real_time_test_ivox_buffered.cpp
 //
 // Publishes at LiDAR frequency:
 //  - Filtered PCD cloud on /pcd
@@ -30,8 +30,7 @@
 #include <pcl/pcl_config.h>
 
 #include <Eigen/Dense>
-// #include "gaussian_octree/gauss_ivox_deprecated.hpp"
-#include "gaussian_octree/gauss_ivox.hpp"
+#include "gaussian_octree/gauss_ivox_buffered.hpp"
 
 struct PointType {
     PointType(): data{0.f, 0.f, 0.f, 1.f} {}
@@ -68,6 +67,7 @@ public:
     lidar_topic_      = this->declare_parameter<std::string>("lidar_topic", "/lidar_points");
     resolution_       = this->declare_parameter<double>("res", 2.0);
     update_threshold_ = this->declare_parameter<int>("update_thresh", 5);
+    max_buffer_size_  = this->declare_parameter<int>("max_buffer_size", 50);
 
     // fixed topics/frames
     frame_id_ = "map";
@@ -93,7 +93,8 @@ public:
     // Declare Incremental Voxel
     ivox_ = std::make_unique<gauss_ivox_mapping::GaussianIVox>(
       static_cast<gauss_ivox_mapping::Scalar>(resolution_),
-      static_cast<std::size_t>(update_threshold_)
+      static_cast<std::size_t>(update_threshold_),
+      static_cast<std::size_t>(max_buffer_size_)
     );
 
     RCLCPP_INFO(get_logger(),
@@ -109,11 +110,12 @@ private:
 
     auto tick = std::chrono::system_clock::now(); 
     for (const auto& p : pc_->points) {
-      gauss_ivox_mapping::Point point;
-      point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
-                    static_cast<gauss_ivox_mapping::Scalar>(p.y),
-                    static_cast<gauss_ivox_mapping::Scalar>(p.z);
-      ivox_->update(point);
+      gauss_ivox_mapping::pointWithCov pv;
+      pv.p << static_cast<gauss_ivox_mapping::Scalar>(p.x),
+                static_cast<gauss_ivox_mapping::Scalar>(p.y),
+                static_cast<gauss_ivox_mapping::Scalar>(p.z);
+      pv.cov = Eigen::Matrix3d::Identity() * 0.01; // Simple isotropic covariance, can be improved with sensor noise model
+      ivox_->update(pv);
     }
     auto tack = std::chrono::system_clock::now();
 
@@ -422,7 +424,7 @@ private:
       // double uncertainty_param = es.eigenvalues().maxCoeff();
       // std::cout << "Plane Param Uncertainty: " << uncertainty_param << std::endl;
 
-      double uncertainty = g.residual_var; // Use the residual variance as an uncertainty proxy
+      double uncertainty = g.plane_cov.trace(); // simple scalar uncertainty metric (sum of eigenvalues)
 
       double u_log = std::log10(uncertainty + 1e-12);
 
@@ -566,6 +568,7 @@ private:
   // params
   double resolution_{5.0};
   int update_threshold_{5};
+  int max_buffer_size_{50};
 
   // fixed
   std::string lidar_topic_{""};

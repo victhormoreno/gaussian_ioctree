@@ -56,9 +56,73 @@ inline void adjugateM3D(const Mat3& A, Mat3& adj) {
     adj(2,2) =  A(0,0)*A(1,1) - A(0,1)*A(1,0);
 }
 
+/**
+ * @brief Auxiliar function to compute covariance of a point measurement in the sensor frame, given range and angular uncertainties
+ * @param point_body Point measurement in the sensor frame
+ * @param range_std Standard deviation of the range measurement
+ * @param angle_rad_std Standard deviation of the angular measurement (in radians)
+ * @param covariance Output covariance matrix in the sensor frame
+ */
+inline void calcBodyCov(Point &point_body,
+                        const Scalar range_std,
+                        const Scalar angle_rad_std,
+                        Mat3 &covariance) {
+    // --- Compute range and its variance ---
+    Scalar range = point_body.norm();
+    Scalar range_variance = range_std * range_std;
+
+    // --- Angular uncertainty (in radians) ---
+    Scalar angle_variance = std::pow(std::sin(angle_rad_std), 2);
+
+    Eigen::Matrix<Scalar, 2, 2> angular_cov = Eigen::Matrix<Scalar, 2, 2>::Zero();
+    angular_cov(0, 0) = angle_variance;
+    angular_cov(1, 1) = angle_variance;
+
+    // --- Normalize direction vector ---
+    V3D direction = point_body;
+    if (std::abs(direction.z()) < 1e-6) {
+        direction.z() = 1e-6;  // avoid numerical instability
+    }
+    direction.normalize();
+
+    // --- Skew-symmetric matrix of direction (cross-product matrix) ---
+    Mat3 direction_skew;
+    direction_skew <<     0, -direction.z(),  direction.y(),
+                   direction.z(),            0, -direction.x(),
+                  -direction.y(),  direction.x(),            0;
+
+    // --- Build orthonormal basis perpendicular to direction ---
+    V3D basis1(1.0, 1.0, -(direction.x() + direction.y()) / direction.z());
+    basis1.normalize();
+
+    V3D basis2 = basis1.cross(direction);
+    basis2.normalize();
+
+    // Matrix whose columns span the tangent plane
+    Eigen::Matrix<Scalar, 3, 2> tangent_basis;
+    tangent_basis.col(0) = basis1;
+    tangent_basis.col(1) = basis2;
+
+    // --- Map angular noise to Cartesian space ---
+    Eigen::Matrix<Scalar, 3, 2> angular_jacobian =
+        range * direction_skew * tangent_basis;
+
+    // --- Final covariance ---
+    covariance =
+        // Radial uncertainty (along beam direction)
+        direction * range_variance * direction.transpose()
+        +
+        // Angular uncertainty (perpendicular to beam)
+        angular_jacobian * angular_cov * angular_jacobian.transpose();
+}
+
+struct pointWithCov {
+    Point p;
+    Mat3 cov;
+};
+
 enum class PrimitiveType {
     UNKNOWN,
-    LINE, // --- To-Do IGNORE ---
     PLANE,
     VOLUME
 };
@@ -74,7 +138,6 @@ struct GaussianPrimitive
     int main_dir; // 0=z dominant, 1=y dominant, 2=x dominant
     Point param;  // [a, b, d] plane parametrization in dominant axis form
     Mat3 plane_cov = Mat3::Zero();
-    Scalar residual_var = 0.0; // variance of the residuals to the plane (approx. fit quality)
 
     // --- Incremental stats (Scatter Matrix) ---
     Scalar xx = 0, yy = 0, zz = 0;
@@ -94,31 +157,23 @@ struct GaussianPrimitive
     }
 
     /**
-     * @brief Merges incremental sums from another primitive using parallel axis theorem
+     * @brief Merges incremental sums from another primitive
      * @param other Another Gaussian primitive to merge
-     * @param delta Spatial offset between voxel centers
      */
-    void mergeSums(const GaussianPrimitive& other, const Point& delta) {
-        Scalar n2 = static_cast<Scalar>(other.count);
+    void mergeSums(const GaussianPrimitive& other) {
+        // Direct accumulation (same reference frame)
+        xx += other.xx;
+        yy += other.yy;
+        zz += other.zz;
 
-        // Shift other's linear sums: x' = x + n*delta
-        Scalar nx_new = other.x + n2 * delta.x();
-        Scalar ny_new = other.y + n2 * delta.y();
-        Scalar nz_new = other.z + n2 * delta.z();
+        xy += other.xy;
+        xz += other.xz;
+        yz += other.yz;
 
-        // Shift other's square/cross sums (Parallel Axis Theorem logic)
-        // xx' = sum((xi + dx)^2) = sum(xi^2 + 2*xi*dx + dx^2) = xx + 2*dx*x + n*dx^2
-        xx += (other.xx + 2.0 * delta.x() * other.x + n2 * delta.x() * delta.x());
-        yy += (other.yy + 2.0 * delta.y() * other.y + n2 * delta.y() * delta.y());
-        zz += (other.zz + 2.0 * delta.z() * other.z + n2 * delta.z() * delta.z());
-        
-        xy += (other.xy + delta.x() * other.y + delta.y() * other.x + n2 * delta.x() * delta.y());
-        xz += (other.xz + delta.x() * other.z + delta.z() * other.x + n2 * delta.x() * delta.z());
-        yz += (other.yz + delta.y() * other.z + delta.z() * other.y + n2 * delta.y() * delta.z());
+        x += other.x;
+        y += other.y;
+        z += other.z;
 
-        x += nx_new;
-        y += ny_new;
-        z += nz_new;
         count += other.count;
     }
 };
@@ -132,6 +187,8 @@ public:
     UnionFindNode *rootNode;
     Point voxel_center; // Center of the voxel for relative point storage
     std::atomic<size_t> points_since_update = 0;
+    std::vector<pointWithCov> points_buffer; // Buffer to store points for covariance computation
+    bool buffer_full = false; // Flag to indicate if buffer has reached capacity
     
     /**
      * @brief Constructs a union-find node for a voxel
@@ -164,10 +221,11 @@ public:
      */
     GaussianIVox(Scalar v_sz, 
                 std::size_t upd_thresh, 
+                std::size_t max_buffer_size = 50,
                 Scalar planarity_thresh = 0.1, 
                 Scalar chi_square_thresh = 7.815,
                 Scalar sensor_noise = 0.01) 
-        : v_size_(v_sz), inv_v_size_(1.0 / v_sz), update_threshold_(upd_thresh),
+        : v_size_(v_sz), inv_v_size_(1.0 / v_sz), update_threshold_(upd_thresh), max_buffer_size_(max_buffer_size),
           planarity_threshold_(planarity_thresh), chi_square_threshold_(chi_square_thresh), 
           noise_(sensor_noise) { }
 
@@ -185,7 +243,8 @@ public:
      * @brief Updates the map with a new point, triggers geometry computation and neighbor merging
      * @param point Point to insert into the map (world-frame coordinates)
      */
-    void update(const Point& point) {
+    void update(const pointWithCov& point_cov) {
+        auto &point = point_cov.p;
         Eigen::Vector3i key = (point * inv_v_size_).array().floor().cast<int>();
 
         Point voxel_center;
@@ -206,13 +265,21 @@ public:
         }
 
         UnionFindNode* root = node->find();
-        root->gauss_ptr->addPoint(point - voxel_center); // Store points relative to voxel center for better numerical stability
+
+        if(root->buffer_full) {
+            checkNeighbors(root, key);
+            return;
+        }
+
+        root->gauss_ptr->addPoint(point);
+        root->points_buffer.push_back(point_cov);
         root->points_since_update++;
+        total_points_++;
 
         // Trigger geometry update incrementally
         if (root->points_since_update >= update_threshold_) {
             computeGeometry(root);
-            checkNeighbors(root, key);
+            // checkNeighbors(root, key);
         }
     }
 
@@ -272,6 +339,35 @@ public:
     }
 
     /**
+     * @brief Clears the map and resets all data
+     */
+    void clear() {
+        std::unique_lock<std::shared_mutex> lock(map_mtx_);
+        for (auto& pair : map_) {
+            delete pair.second;
+        }
+        map_.clear();
+        total_points_ = 0;
+    }
+
+    /**
+     * @brief Returns the total number of points inserted into the map
+     * @return Total number of points
+     */
+    size_t getTotalPoints() const {
+        return total_points_.load();
+    }
+
+    /**
+     * @brief Returns the total number of voxels
+     * @return Total number of voxels
+     */
+    size_t size() const {
+        std::shared_lock<std::shared_mutex> lock(map_mtx_);
+        return map_.size();
+    }
+
+    /**
      * @brief Constructs the plane normal vector based on dominant axis
      * @param p Plane parameters [a, b, d] in dominant axis form
      * @param main_dir Dominant axis (0=z, 1=y, 2=x)
@@ -298,10 +394,10 @@ public:
 
         Scalar n = static_cast<Scalar>(g->count);
 
-        // Recovery: World Mean = Local Mean + Voxel Center
-        g->mean << (g->x / n) + node->voxel_center.x(),
-                    (g->y / n) + node->voxel_center.y(),
-                    (g->z / n) + node->voxel_center.z();
+        // World Mean
+        g->mean << (g->x / n),
+                    (g->y / n),
+                    (g->z / n);
 
         // Unbiased covariance estimation using the scatter matrix and mean
         Scalar inv = 1.0 / (n - 1); // Sample covariance normalization
@@ -320,14 +416,12 @@ public:
 
         // PCA classification
         Scalar l0 = std::max(evals(0), 0.0);
-        Scalar l1 = std::max(evals(1), 0.0);
-        Scalar l2 = std::max(evals(2), 0.0);
 
         // Primitive classification
-        if (l0/(l0 + l1 + l2) < planarity_threshold_) {
+        if (l0 < planarity_threshold_) {
             g->type = PrimitiveType::PLANE;
 
-            if(!solvePlaneAdjugate(node, evals, es.eigenvectors().col(0)))
+            if(!solvePlaneAdjugate(node, es.eigenvectors().col(0)))
                 g->type = PrimitiveType::UNKNOWN; // Degenerate case, keep as UNKNOWN
         }
         else {
@@ -337,6 +431,10 @@ public:
         }
 
         node->points_since_update = 0;
+        if(node->points_buffer.size() >= max_buffer_size_) {
+            node->buffer_full = true;
+            std::vector<pointWithCov>().swap(node->points_buffer); // Clear buffer to save memory
+        }
     }
 
     /**
@@ -369,6 +467,9 @@ public:
 
         GaussPtr ga = a->gauss_ptr;
         GaussPtr gb = b->gauss_ptr;
+
+        // Only merge fully build planes or volumes
+        if(!(a->buffer_full) || !(b->buffer_full)) return;
 
         // Only merge same type primitives
         if (ga->type != gb->type || ga->type == PrimitiveType::UNKNOWN) return;
@@ -425,8 +526,7 @@ public:
 
         b->rootNode = a; // DSU Union: root of b points to root of a
 
-        Point delta = b->voxel_center - a->voxel_center; // spatial shift
-        ga->mergeSums(*(gb), delta); // Merge incremental sums for accurate geometry update
+        ga->mergeSums(*(gb)); // Merge incremental sums for accurate geometry update
 
         switch (ga->type) {
             case PrimitiveType::PLANE: {
@@ -458,13 +558,11 @@ public:
     /**
      * @brief Solves plane parameters using adjugate method, selects stable axis form
      * @param node Union-find node containing point statistics
-     * @param evals Eigenvalues of covariance matrix
      * @param evecMin Smallest eigenvector for axis selection
      * @return true if plane solved successfully, false if degenerate
      */
     bool solvePlaneAdjugate(
         UnionFindNode* node,
-        const Point& evals,
         const Point& evecMin
     ) {
         Mat3 A, A_star;
@@ -517,47 +615,81 @@ public:
 
         Point param = (A_star * E) / detA;
 
-        // --- Transform plane offset to world-frame ---
-        Point n_vec = buildNormalVector(param, g->main_dir);
-        param[2] -= n_vec.dot(node->voxel_center);
-
-        // Store dominant axis parameters [a, b, d_world] for merging logic
+        // Store dominant axis parameters [a, b, d] for merging logic
         g->param = param; 
 
-        // --- Compute plane covariance ---
-        // Calculate the variance of the residuals (sigma^2)
-        // l0 is the mean squared error; we multiply by n to get the sum of squares
-        Scalar residual_var = (evals(0) * n) / std::max(n - 3.0, 1.0);
+        // --- Compute analytical plane covariance ---
+        Point ddetA_dpw;
+        Mat3 dAstarE_dpw, J_pw;
 
-        // Add Sensor Noise Floor (Hardware Limit)
-        // VoxelMap++ suggests that the hardware noise is a constant offset 
-        // to the residual variance.
-        const Scalar kSensorNoise = noise_*noise_; 
-        Scalar total_sigma2 = residual_var + kSensorNoise;
-
-        // The covariance of the solved parameters [a, b, d] is sigma^2 * A^-1
-        // We already have A_star (adjugate) and detA.
-        Mat3 C_param = (A_star / detA) * total_sigma2;
-
-        g->residual_var = C_param.trace(); // Store for debugging/visualization purposes
-
-        Mat3 T = Mat3::Identity();
-        switch(g->main_dir) {
-            case 0: 
-                T(2,0) = -node->voxel_center.x(); T(2,1) = -node->voxel_center.y(); 
-                break;
-            case 1: 
-                T(2,0) = -node->voxel_center.x(); T(2,1) = -node->voxel_center.z(); 
-                break;
-            case 2: 
-                T(2,0) = -node->voxel_center.y(); T(2,1) = -node->voxel_center.z(); 
-                break;
-            default:
-                return false; // should never happen
+        for (auto pv : node->points_buffer) {
+            Scalar xi = pv.p[0];
+            Scalar yi = pv.p[1];
+            Scalar zi = pv.p[2];
+            switch(g->main_dir) {
+                case 0: // z dominant
+                    ddetA_dpw
+                            << 2 * n * xi * yy + 2 * y * (xy + yi * x) - 2 * yy * x - 2 * xi * y * y - 2 * n * yi * xy,
+                            2 * n * yi * xx + 2 * x * (xy + xi * y) - 2 * xx * y - 2 * yi * x * x - 2 * n * xi * xy,
+                            0.0;
+                    dAstarE_dpw << zi * y * y - n * zi * yy + n * yi * yz - yz * y + yy * z - yi * y * z,
+                            2 * xz * y - 2 * n * yi * xz + n * (xi * yz + zi * xy) - x * (yz + zi * y) +
+                            2 * yi * x * z - z * (xy + xi * y),
+                            xi * y * y - n * xi * yy + n * yi * xy - yi * x * y + yy * x - xy * y,
+                            n * (yi * xz + zi * xy) - y * (xz + zi * x) + 2 * yz * x - 2 * n * xi * yz +
+                            2 * xi * y * z - z * (yi * x + xy),
+                            n * xi * xz - x * xz + zi * x * x - n * zi * xx + xx * z - xi * x * z,
+                            n * xi * xy - xi * x * y + yi * x * x - n * yi * xx + xx * y - xy * x,
+                            yy * (xz + zi * x) - y * (zi * xy + yi * xz) + 2 * xi * yz * y - yz * (xy + yi * x) +
+                            2 * yi * z * xy - 2 * xi * z * yy,
+                            2 * yi * xz * x - xz * (xi * y + xy) + xx * (yz + zi * y) - x * (zi * xy + xi * yz) +
+                            2 * xi * z * xy - 2 * yi * z * xx,
+                            xi * yy * x - xi * xy * y + yi * xx * y - yi * xy * x + xy * xy - xx * yy;
+                    break;
+                case 1: // y dominant
+                    ddetA_dpw
+                            << 2 * n * xi * zz + 2 * z * (xz + zi * x) - 2 * zz * x - 2 * xi * z * z - 2 * n * zi * xz,
+                            0.0,
+                            2 * n * zi * xx + 2 * x * (xz + xi * z) - 2 * zi * x * x - 2 * xx * z - 2 * n * xi * xz;
+                    dAstarE_dpw << yi * z * z - n * yi * zz + n * zi * yz - yz * z + y * zz - zi * y * z,
+                            xi * z * z - n * xi * zz + n * zi * xz - zi * x * z + zz * x - xz * z,
+                            2 * xy * z - 2 * n * zi * xy + n * (yi * xz + xi * yz) - x * (yz + yi * z) +
+                            2 * zi * y * x - y * (xz + xi * z),
+                            n * (yi * xz + zi * xy) - z * (xy + yi * x) + 2 * yz * x - 2 * n * xi * yz +
+                            2 * xi * y * z - y * (xz + zi * x),
+                            n * xi * xz - xi * x * z + zi * x * x - n * zi * xx + xx * z - xz * x,
+                            n * xi * xy - xy * x + yi * x * x - n * yi * xx + y * xx - xi * y * x,
+                            zz * (yi * x + xy) - z * (yi * xz + zi * xy) + 2 * xi * yz * z - yz * (xz + zi * x) +
+                            2 * zi * y * xz - 2 * xi * y * zz,
+                            xi * zz * x - xi * xz * z + zi * xx * z - zi * xz * x + xz * xz - xx * zz,
+                            2 * zi * xy * x - xy * (xi * z + xz) + xx * (yz + yi * z) - x * (yi * xz + xi * yz) +
+                            2 * xi * y * xz - 2 * zi * y * xx;
+                    break;
+                case 2: // x dominant
+                    ddetA_dpw << 0.0,
+                            2 * n * yi * zz + 2 * z * (yz + zi * y) - 2 * zz * y - 2 * yi * z * z - 2 * n * zi * yz,
+                            2 * n * zi * yy + 2 * y * (yz + yi * z) - 2 * zi * y * y - 2 * yy * z - 2 * n * yi * yz;
+                    dAstarE_dpw << yi * z * z - n * yi * zz + n * zi * yz - zi * y * z + zz * y - yz * z,
+                            xi * z * z - n * xi * zz + n * zi * xz - xz * z + x * zz - zi * x * z,
+                            2 * xy * z - 2 * n * zi * xy + n * (xi * yz + yi * xz) - y * (xz + xi * z) +
+                            2 * zi * x * y - x * (yz + yi * z),
+                            n * yi * yz - yi * y * z + zi * y * y - n * zi * yy + yy * z - yz * y,
+                            n * (xi * yz + zi * xy) - z * (xy + xi * y) + 2 * xz * y - 2 * n * yi * xz +
+                            2 * yi * x * z - x * (yz + zi * y),
+                            n * yi * xy - xy * y + xi * y * y - n * xi * yy + x * yy - yi * x * y,
+                            yi * zz * y - yi * yz * z + zi * yy * z - zi * yz * y + yz * yz - yy * zz,
+                            zz * (xy + xi * y) - z * (xi * yz + zi * xy) + 2 * yi * xz * z - xz * (yz + zi * y) +
+                            2 * zi * x * yz - 2 * yi * x * zz,
+                            2 * zi * xy * y - xy * (yz + yi * z) + yy * (xz + xi * z) - y * (xi * yz + yi * xz) +
+                            2 * yi * x * yz - 2 * zi * x * yy;
+                    break;
+                default:
+                    return false; // should never happen
+            }
+            
+            J_pw = A_star * E * (-1.0 * ddetA_dpw / detA / detA).transpose() + dAstarE_dpw / detA;
+            g->plane_cov += J_pw * pv.cov * J_pw.transpose();
         }
-
-        // This is the covariance of [a, b, d_world]
-        g->plane_cov = T * C_param * T.transpose();
 
         return true;
     }
@@ -566,6 +698,8 @@ public:
     std::unordered_map<Eigen::Vector3i, UnionFindNode*, HashVec3i> map_;
     Scalar v_size_, inv_v_size_;
     std::size_t update_threshold_;
+    std::size_t max_buffer_size_;
+    std::atomic<size_t> total_points_{0};
     Scalar planarity_threshold_;  // Tunable threshold for plane classification
     Scalar chi_square_threshold_; // Tunable threshold for plane merging
     Scalar noise_;                // Sensor noise floor for covariance estimation
