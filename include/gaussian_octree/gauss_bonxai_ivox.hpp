@@ -1,41 +1,23 @@
 #pragma once
 
 #include <Eigen/Dense>
-#include <unordered_map>
-#include <vector>
-#include <shared_mutex>
 #include <memory>
 #include <atomic>
-#include <cmath>
+#include <shared_mutex>
+#include <vector>
 
-namespace gauss_ivox_mapping {
+// Include Bonxai headers (assuming they are in your include path)
+#include "bonxai/bonxai.hpp"
+
+namespace gauss_mapping {
 
 using Scalar = double;
 using Point  = Eigen::Matrix<Scalar, 3, 1>;
 using Mat3   = Eigen::Matrix<Scalar, 3, 3>;
 
-/**
- * @brief Combines two hash values using FNV-like mixing.
- * @param seed Initial hash seed
- * @param v Value to combine
- */
-inline size_t hash_combine(size_t seed, size_t v) {
-    return seed ^ (v + 0x9e3779b97f4a7c15ULL + (seed << 6) + (seed >> 2));
-}
-
-struct HashVec3i {
-    /**
-     * @brief Hash function for 3D integer vectors
-     * @param v 3D vector to hash
-     */
-    size_t operator()(const Eigen::Vector3i& v) const {
-        size_t seed = 0;
-        seed = hash_combine(seed, std::hash<int>()(v[0]));
-        seed = hash_combine(seed, std::hash<int>()(v[1]));
-        seed = hash_combine(seed, std::hash<int>()(v[2]));
-        return seed;
-    }
-};
+using Scalar = double;
+using Point  = Eigen::Matrix<Scalar, 3, 1>;
+using Mat3   = Eigen::Matrix<Scalar, 3, 3>;
 
 /**
  * @brief Computes the adjugate (adjoint) matrix of a 3x3 matrix
@@ -63,7 +45,7 @@ inline void adjugateM3D(const Mat3& A, Mat3& adj) {
  * @param angle_rad_std Standard deviation of the angular measurement (in radians)
  * @param covariance Output covariance matrix in the sensor frame
  */
-inline void calcBodyCov(Point &point_body,
+inline void calcBodyCov(Point point_body,
                         const Scalar range_std,
                         const Scalar angle_rad_std,
                         Mat3 &covariance) {
@@ -79,7 +61,7 @@ inline void calcBodyCov(Point &point_body,
     angular_cov(1, 1) = angle_variance;
 
     // --- Normalize direction vector ---
-    V3D direction = point_body;
+    Point direction = point_body;
     if (std::abs(direction.z()) < 1e-6) {
         direction.z() = 1e-6;  // avoid numerical instability
     }
@@ -92,10 +74,10 @@ inline void calcBodyCov(Point &point_body,
                   -direction.y(),  direction.x(),            0;
 
     // --- Build orthonormal basis perpendicular to direction ---
-    V3D basis1(1.0, 1.0, -(direction.x() + direction.y()) / direction.z());
+    Point basis1(1.0, 1.0, -(direction.x() + direction.y()) / direction.z());
     basis1.normalize();
 
-    V3D basis2 = basis1.cross(direction);
+    Point basis2 = basis1.cross(direction);
     basis2.normalize();
 
     // Matrix whose columns span the tangent plane
@@ -176,48 +158,54 @@ struct GaussianPrimitive
 
         count += other.count;
     }
+
+    /**
+     * @brief Constructs the plane normal vector based on dominant axis
+     * @return Normal vector in form [x, y, z] == [a, b, c]
+     */
+    Point buildNormalVector() const {
+        Point w;
+        switch (main_dir) {
+            case 0: w << param(0), param(1), 1.0; break;
+            case 1: w << param(0), 1.0, param(1); break;
+            case 2: w << 1.0, param(0), param(1); break;
+        }
+        return w;
+    }
 };
 
 using GaussPtr = std::shared_ptr<GaussianPrimitive>;
 
-class UnionFindNode {
-public:
+/**
+ * @brief Node for Union-Find, stored inside Bonxai cells.
+ */
+struct UnionFindNode {
     EIGEN_MAKE_ALIGNED_OPERATOR_NEW
-    GaussPtr gauss_ptr;
-    UnionFindNode *rootNode;
-    Point voxel_center; // Center of the voxel for relative point storage
-    std::atomic<size_t> points_since_update = 0;
-    std::vector<pointWithCov> points_buffer; // Buffer to store points for covariance computation
-    bool buffer_full = false; // Flag to indicate if buffer has reached capacity
+    std::shared_ptr<GaussianPrimitive> gauss_ptr;
+    UnionFindNode* parent = nullptr; // DSU Parent
+    Point voxel_center;
     
-    /**
-     * @brief Constructs a union-find node for a voxel
-     * @param center Center coordinates of the voxel
-     */
+    std::atomic<size_t> points_since_update{0};
+    std::vector<pointWithCov> points_buffer;
+    bool buffer_full = false;
+
     UnionFindNode(const Point& center) : voxel_center(center) {
         gauss_ptr = std::make_shared<GaussianPrimitive>();
-        rootNode = this;
+        parent = this;
     }
 
-    /**
-     * @brief Finds root node with path compression
-     */
+    // DSU Find with Path Compression
     UnionFindNode* find() {
-        if (rootNode == this) return this;
-        return rootNode = rootNode->find();
+        if (parent == this) return this;
+        return parent = parent->find();
     }
 };
 
 class GaussianIVox {
 public:
-
     /**
-     * @brief Constructs a GaussianIVox map with specified parameters
-     * @param v_sz Voxel size (resolution)
-     * @param upd_thresh Update threshold (points to accumulate before geometry recomputation)
-     * @param planarity_thresh Threshold for plane vs volume classification
-     * @param chi_square_thresh Mahalanobis distance threshold for merging
-     * @param sensor_noise Sensor noise floor for covariance regularization
+     * @param v_sz Voxel resolution
+     * @param leaf_bits Bonxai leaf size (3 = 8x8x8 block)
      */
     GaussianIVox(Scalar v_sz, 
                 std::size_t upd_thresh, 
@@ -225,168 +213,173 @@ public:
                 Scalar planarity_thresh = 0.1, 
                 Scalar chi_square_thresh = 7.815,
                 Scalar sensor_noise = 0.01) 
-        : v_size_(v_sz), inv_v_size_(1.0 / v_sz), update_threshold_(upd_thresh), max_buffer_size_(max_buffer_size),
-          planarity_threshold_(planarity_thresh), chi_square_threshold_(chi_square_thresh), 
-          noise_(sensor_noise) { }
+        : v_size_(v_sz), 
+          update_threshold_(upd_thresh), 
+          max_buffer_size_(max_buffer_size),
+          planarity_threshold_(planarity_thresh), 
+          chi_square_threshold_(chi_square_thresh), 
+          noise_(sensor_noise),
+          grid_(v_sz) // Initialize Bonxai Grid
+    {}
 
     /**
-     * @brief Destructor: cleans up all union-find nodes
-     */
-    ~GaussianIVox() {
-        for (auto& pair : map_) {
-            delete pair.second;
-        }
-        map_.clear();
-    }
-
-    /**
-     * @brief Updates the map with a new point, triggers geometry computation and neighbor merging
-     * @param point Point to insert into the map (world-frame coordinates)
+     * @brief Update using Bonxai Accessor for O(1) cached lookup
      */
     void update(const pointWithCov& point_cov) {
-        auto &point = point_cov.p;
-        Eigen::Vector3i key = (point * inv_v_size_).array().floor().cast<int>();
+        auto& p = point_cov.p;
+        auto coord = grid_.posToCoord(p.x(), p.y(), p.z());
 
-        Point voxel_center;
-        voxel_center[0] = (key.x() + 0.5) * v_size_;
-        voxel_center[1] = (key.y() + 0.5) * v_size_;
-        voxel_center[2] = (key.z() + 0.5) * v_size_;
-        
         UnionFindNode* node = nullptr;
         {
+            // Lock striping or a shared_mutex is still needed for multi-threaded insertion
             std::unique_lock<std::shared_mutex> lock(map_mtx_);
-            auto it = map_.find(key);
-            if (it == map_.end()) {
-                node = new UnionFindNode(voxel_center);
-                map_[key] = node;
-            } else {
-                node = it->second;
+            auto accessor = grid_.createAccessor();
+            
+            // getCell returns DataT*, we store unique_ptr to UnionFindNode
+            auto cell_ptr = accessor.value(coord, true); 
+            
+            if (!(*cell_ptr)) {
+                Point center = grid_.coordToPos(coord).toEigen(); // Assuming toEigen() helper
+                *cell_ptr = std::make_unique<UnionFindNode>(center);
             }
+            node = cell_ptr->get();
         }
 
         UnionFindNode* root = node->find();
 
-        if(root->buffer_full) {
-            checkNeighbors(root, key);
+        if (root->buffer_full) {
+            checkNeighbors(root, coord);
             return;
         }
 
-        root->gauss_ptr->addPoint(point);
+        root->gauss_ptr->addPoint(p);
         root->points_buffer.push_back(point_cov);
         root->points_since_update++;
         total_points_++;
 
-        // Trigger geometry update incrementally
         if (root->points_since_update >= update_threshold_) {
             computeGeometry(root);
-            // checkNeighbors(root, key);
         }
     }
 
-    /**
-     * @brief Retrieves the Gaussian primitive at a given point location
-     * @param p Query point in world coordinates
-     * @return Shared pointer to the root Gaussian primitive, or nullptr if not found
-     */
-    GaussPtr getPrimitiveAtPoint(const Point& p) const
-    {
-        Eigen::Vector3i key = (p * inv_v_size_).array().floor().cast<int>();
-
+    // --- Search Logic using Bonxai bit-offsets ---
+    void checkNeighbors(UnionFindNode* root, const Bonxai::CoordT& coord) {
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
+        auto accessor = grid_.createConstAccessor();
 
-        auto it = map_.find(key);
-        if (it == map_.end())
-            return nullptr;
-
-        UnionFindNode* node = it->second;
-        UnionFindNode* root = node->find();
-
-        return root->gauss_ptr;
-    }
-
-    /**
-     * @brief Thread-safe retrieval of all unique root Gaussian primitives
-     * @return Vector of shared pointers to all root Gaussians in the map
-     */
-    std::vector<GaussPtr> getGaussians() const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        std::vector<GaussPtr> result;
-        for (auto const& [_, node] : map_) {
-            if (node->rootNode != node) continue; // only roots
-            result.push_back(node->gauss_ptr);
-        }
-        return result;
-    }
-
-    /**
-     * @brief Thread-safe retrieval of Gaussians filtered by primitive type
-     * @param type Primitive type to filter (PLANE, VOLUME, etc.)
-     * @return Vector of shared pointers to Gaussians of the specified type
-     */
-    std::vector<GaussPtr> getByType(PrimitiveType type) const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        std::vector<GaussPtr> result;
-        for (const auto& [_, node] : map_) {
-            if (node->rootNode != node) continue; // only roots
-
-            const auto& g = node->gauss_ptr;
-            if (g && g->type == type) {
-                result.push_back(g);
+        // Check 6-neighbors
+        static const int offsets[6][3] = {{1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}};
+        
+        for (const auto& off : offsets) {
+            Bonxai::CoordT neighbor_coord = {coord.x + off[0], coord.y + off[1], coord.z + off[2]};
+            if (auto* neighbor_cell = accessor.value(neighbor_coord)) {
+                if (*neighbor_cell) {
+                    UnionFindNode* neighbor_root = (*neighbor_cell)->find();
+                    if (neighbor_root != root) {
+                        tryMerge(root, neighbor_root);
+                    }
+                }
             }
         }
-
-        return result;
     }
 
     /**
-     * @brief Clears the map and resets all data
+     * @brief Attempts to merge two primitives using Mahalanobis distance test
+     * @param a Root node of first primitive
+     * @param b Root node of second primitive
      */
-    void clear() {
-        std::unique_lock<std::shared_mutex> lock(map_mtx_);
-        for (auto& pair : map_) {
-            delete pair.second;
+    void tryMerge(UnionFindNode* a, UnionFindNode* b) {
+
+        GaussPtr ga = a->gauss_ptr;
+        GaussPtr gb = b->gauss_ptr;
+
+        // Only merge fully build planes or volumes
+        if(!(a->buffer_full) || !(b->buffer_full)) return;
+
+        // Only merge same type primitives
+        if (ga->type != gb->type || ga->type == PrimitiveType::UNKNOWN) return;
+
+        bool merge = false;
+        switch (ga->type) {
+            case PrimitiveType::PLANE: {
+                // --- Mahalanobis distance for Plane similarity ---
+                if(ga->main_dir != gb->main_dir) break;
+
+                Point na = ga->buildNormalVector();
+                Point nb = gb->buildNormalVector();
+
+                if (na.dot(nb) < 0) {
+                    gb->param *= -1.0;
+                }
+
+                // (Bayesian style)
+                Eigen::Vector3d delta_pi = ga->param - gb->param; 
+
+                // Add a regularization term to the sum of covariances
+                // This represents the uncertainty of the "link" between two voxels.
+                Mat3 cov_sum = ga->plane_cov + gb->plane_cov;
+                cov_sum.diagonal().array() += noise_*noise_; // regularization floor
+
+                Scalar m_dist_sq = delta_pi.transpose() * cov_sum.inverse() * delta_pi;
+
+                if (m_dist_sq < chi_square_threshold_)
+                    merge = true;
+
+                break;
+            }
+
+            case PrimitiveType::VOLUME: {
+                // --- Mahalanobis distance on means for Gaussian similarity ---
+                Point diff = gb->mean - ga->mean;
+                Mat3 cov_sum = ga->cov + gb->cov;
+                cov_sum.diagonal().array() += noise_*noise_; // regularization floor
+                if (cov_sum.determinant() < 1e-12) break;
+
+                Scalar m_dist_sq = diff.transpose() * cov_sum.inverse() * diff;
+
+                if (m_dist_sq < chi_square_threshold_) 
+                    merge = true;
+
+                break;
+            }
+
+            default:
+                break;
         }
-        map_.clear();
-        total_points_ = 0;
-    }
 
-    /**
-     * @brief Returns the total number of points inserted into the map
-     * @return Total number of points
-     */
-    size_t getTotalPoints() const {
-        return total_points_.load();
-    }
+        if(!merge) return;
 
-    /**
-     * @brief Returns the total number of voxels
-     * @return Total number of voxels
-     */
-    size_t size() const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        return map_.size();
-    }
+        b->parent = a; // DSU Union: root of b points to root of a
 
-    /**
-     * @brief Constructs the plane normal vector based on dominant axis
-     * @param p Plane parameters [a, b, d] in dominant axis form
-     * @param main_dir Dominant axis (0=z, 1=y, 2=x)
-     * @return Normal vector in form [x, y, z] == [a, b, c]
-     */
-    Point buildNormalVector(const Point& p, int main_dir) {
-        Point w;
-        switch (main_dir) {
-            case 0: w << p[0], p[1], 1.0; break;
-            case 1: w << p[0], 1.0, p[1]; break;
-            case 2: w << 1.0, p[0], p[1]; break;
+        ga->mergeSums(*(gb)); // Merge incremental sums for accurate geometry update
+
+        switch (ga->type) {
+            case PrimitiveType::PLANE: {
+                // VoxelMap++ merging logic: weighted average of plane parameters based on covariance "confidence"
+                Scalar trA = ga->plane_cov.trace();
+                Scalar trB = gb->plane_cov.trace();
+
+                Scalar wA = trB / (trA + trB);
+                Scalar wB = trA / (trA + trB);
+                
+                ga->param = wA * ga->param + wB * gb->param;
+                ga->plane_cov = wA * wA * ga->plane_cov + wB * wB * gb->plane_cov;
+
+                break;
+            }
+            
+            case PrimitiveType::VOLUME: {
+                computeGeometry(a); // Recompute mean and covariance for merged volume
+                break;
+            }
+
+            default:
+                break;
         }
-        return w;
+
+        b->gauss_ptr.reset(); // Clear merged primitive to save memory, only root holds valid Gaussian
     }
 
-    /**
-     * @brief Computes Gaussian geometry from scatter matrix, classifies primitive type via PCA
-     * @param node Union-find node containing the point statistics
-     */
     void computeGeometry(UnionFindNode* node) {
 
         auto& g = node->gauss_ptr;
@@ -431,128 +424,16 @@ public:
         }
 
         node->points_since_update = 0;
-        if(node->points_buffer.size() >= max_buffer_size_) {
+        if (node->points_buffer.size() >= max_buffer_size_) {
             node->buffer_full = true;
-            std::vector<pointWithCov>().swap(node->points_buffer); // Clear buffer to save memory
+            node->points_buffer.clear();
+            node->points_buffer.shrink_to_fit();
         }
     }
 
-    /**
-     * @brief Checks 6-neighbor voxels and attempts merging with same-type primitives
-     * @param root Root union-find node of current voxel
-     * @param key Voxel grid key of current location
-     */
-    void checkNeighbors(UnionFindNode* root, const Eigen::Vector3i& key) {
-        
-        // 6-Neighbor Search for Merging (DSU)
+    size_t size() const {
         std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        int offsets[6][3] = {{-1,0,0}, {1,0,0}, {0,-1,0}, {0,1,0}, {0,0,1}, {0,0,-1}};
-
-        for (auto& off : offsets) {
-            Eigen::Vector3i neighbor_key(key.x() + off[0], key.y() + off[1], key.z() + off[2]);
-            auto it = map_.find(neighbor_key);
-            if (it != map_.end()) {
-                UnionFindNode* neighbor_root = it->second->find();
-                if (neighbor_root != root) tryMerge(root, neighbor_root);
-            }
-        }
-    }
-
-    /**
-     * @brief Attempts to merge two primitives using Mahalanobis distance test
-     * @param a Root node of first primitive
-     * @param b Root node of second primitive
-     */
-    void tryMerge(UnionFindNode* a, UnionFindNode* b) {
-
-        GaussPtr ga = a->gauss_ptr;
-        GaussPtr gb = b->gauss_ptr;
-
-        // Only merge fully build planes or volumes
-        if(!(a->buffer_full) || !(b->buffer_full)) return;
-
-        // Only merge same type primitives
-        if (ga->type != gb->type || ga->type == PrimitiveType::UNKNOWN) return;
-
-        bool merge = false;
-        switch (ga->type) {
-            case PrimitiveType::PLANE: {
-                // --- Mahalanobis distance for Plane similarity ---
-                if(ga->main_dir != gb->main_dir) break;
-
-                Point na = buildNormalVector(ga->param, ga->main_dir);
-                Point nb = buildNormalVector(gb->param, gb->main_dir);
-
-                if (na.dot(nb) < 0) {
-                    gb->param *= -1.0;
-                }
-
-                // (Bayesian style)
-                Eigen::Vector3d delta_pi = ga->param - gb->param; 
-
-                // Add a regularization term to the sum of covariances
-                // This represents the uncertainty of the "link" between two voxels.
-                Mat3 cov_sum = ga->plane_cov + gb->plane_cov;
-                cov_sum.diagonal().array() += noise_*noise_; // regularization floor
-
-                Scalar m_dist_sq = delta_pi.transpose() * cov_sum.inverse() * delta_pi;
-
-                if (m_dist_sq < chi_square_threshold_)
-                    merge = true;
-
-                break;
-            }
-
-            case PrimitiveType::VOLUME: {
-                // --- Mahalanobis distance on means for Gaussian similarity ---
-                Point diff = gb->mean - ga->mean;
-                Mat3 cov_sum = ga->cov + gb->cov;
-                cov_sum.diagonal().array() += noise_*noise_; // regularization floor
-                if (cov_sum.determinant() < 1e-12) break;
-
-                Scalar m_dist_sq = diff.transpose() * cov_sum.inverse() * diff;
-
-                if (m_dist_sq < chi_square_threshold_) 
-                    merge = true;
-
-                break;
-            }
-
-            default:
-                break;
-        }
-
-        if(!merge) return;
-
-        b->rootNode = a; // DSU Union: root of b points to root of a
-
-        ga->mergeSums(*(gb)); // Merge incremental sums for accurate geometry update
-
-        switch (ga->type) {
-            case PrimitiveType::PLANE: {
-                // VoxelMap++ merging logic: weighted average of plane parameters based on covariance "confidence"
-                Scalar trA = ga->plane_cov.trace();
-                Scalar trB = gb->plane_cov.trace();
-
-                Scalar wA = trB / (trA + trB);
-                Scalar wB = trA / (trA + trB);
-                
-                ga->param = wA * ga->param + wB * gb->param;
-                ga->plane_cov = wA * wA * ga->plane_cov + wB * wB * gb->plane_cov;
-
-                break;
-            }
-            
-            case PrimitiveType::VOLUME: {
-                computeGeometry(a); // Recompute mean and covariance for merged volume
-                break;
-            }
-
-            default:
-                break;
-        }
-
-        b->gauss_ptr.reset(); // Clear merged primitive to save memory, only root holds valid Gaussian
+        return grid_.activeCellsCount();
     }
 
     /**
@@ -694,15 +575,18 @@ public:
         return true;
     }
 
-    mutable std::shared_mutex map_mtx_;
-    std::unordered_map<Eigen::Vector3i, UnionFindNode*, HashVec3i> map_;
-    Scalar v_size_, inv_v_size_;
+private:
+    Scalar v_size_;
     std::size_t update_threshold_;
     std::size_t max_buffer_size_;
+    Scalar planarity_threshold_;
+    Scalar chi_square_threshold_;
+    Scalar noise_;
     std::atomic<size_t> total_points_{0};
-    Scalar planarity_threshold_;  // Tunable threshold for plane classification
-    Scalar chi_square_threshold_; // Tunable threshold for plane merging
-    Scalar noise_;                // Sensor noise floor for covariance estimation
+
+    mutable std::shared_mutex map_mtx_;
+    // We store a unique_ptr to the Node inside Bonxai
+    Bonxai::VoxelGrid<std::unique_ptr<UnionFindNode>> grid_;
 };
 
-} // namespace gauss_ivox_mapping
+} // namespace gauss_mapping

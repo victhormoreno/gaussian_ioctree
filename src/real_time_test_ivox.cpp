@@ -76,7 +76,7 @@ public:
     voxel_topic_ = "/voxels";
 
     if (resolution_ <= 0.0) resolution_ = 0.001;
-    if (update_threshold_ <= 0) update_threshold_ = 5;
+    if (update_threshold_ <= 0) update_threshold_ = 1;
 
     cloud_pub_ = this->create_publisher<sensor_msgs::msg::PointCloud2>(
       topic_, rclcpp::QoS(1).transient_local());
@@ -107,14 +107,19 @@ private:
     pcl::PointCloud<PointType>::Ptr pc_ (std::make_shared<pcl::PointCloud<PointType>>());
     pcl::fromROSMsg(msg, *pc_);
 
-    auto tick = std::chrono::system_clock::now(); 
+    std::vector<gauss_ivox_mapping::pointWithCov> points_w_cov;
+
     for (const auto& p : pc_->points) {
-      gauss_ivox_mapping::Point point;
-      point << static_cast<gauss_ivox_mapping::Scalar>(p.x),
-                    static_cast<gauss_ivox_mapping::Scalar>(p.y),
-                    static_cast<gauss_ivox_mapping::Scalar>(p.z);
-      ivox_->update(point);
+      gauss_ivox_mapping::pointWithCov point_w_cov;
+      point_w_cov.p << static_cast<gauss_ivox_mapping::Scalar>(p.x),
+                        static_cast<gauss_ivox_mapping::Scalar>(p.y),
+                        static_cast<gauss_ivox_mapping::Scalar>(p.z);
+      point_w_cov.cov = 0.001 * gauss_ivox_mapping::Mat3::Identity(); // fixed covariance for testing
+      points_w_cov.push_back(point_w_cov);
     }
+
+    auto tick = std::chrono::system_clock::now(); 
+    ivox_->update(points_w_cov);
     auto tack = std::chrono::system_clock::now();
 
     std::chrono::duration<double> elapsed_time = tack-tick;
@@ -125,13 +130,18 @@ private:
     cloud_pub_->publish(msg);
 
 
-    std::vector<gauss_ivox_mapping::GaussPtr> gauss = ivox_->getGaussians();
+    // std::vector<gauss_ivox_mapping::GaussPtr> gauss = ivox_->getGaussians();
 
-    RCLCPP_INFO(get_logger(), "Ivox has %zu active gaussians and took %f ms to update", gauss.size(), elapsed_time.count()*1000.0);
+    // RCLCPP_INFO(get_logger(), "Ivox has %zu active gaussians and took %f ms to update", gauss.size(), elapsed_time.count()*1000.0);
+    RCLCPP_INFO(get_logger(), "Ivox took %f ms to update", elapsed_time.count()*1000.0);
 
-    gauss_pub_->publish(makeGaussianMarkers(*ivox_.get(), this->now()));
-    uncertainty_pub_->publish(makeUncertaintyMarkers(*ivox_.get(), this->now()));
-    voxel_pub_->publish(makeVoxelMarkers(*ivox_.get(), this->now(), resolution_));
+    RCLCPP_INFO(this->get_logger(), 
+                ivox_->profiler_.str()
+                .c_str());
+
+    // gauss_pub_->publish(makeGaussianMarkers(*ivox_.get(), this->now()));
+    // uncertainty_pub_->publish(makeUncertaintyMarkers(*ivox_.get(), this->now()));
+    // voxel_pub_->publish(makeVoxelMarkers(*ivox_.get(), this->now(), resolution_));
 
   }
 
@@ -140,7 +150,7 @@ private:
       const rclcpp::Time& stamp)
   {
       visualization_msgs::msg::MarkerArray arr;
-      std::shared_lock lock(ivox.map_mtx_); // safe map access
+    //   std::shared_lock lock(ivox.map_mtx_); // safe map access
 
       std::mt19937 gen(12345); // fixed seed for consistent cluster colors
       std::uniform_real_distribution<float> dis(0.0f, 1.0f);
@@ -198,7 +208,7 @@ private:
       const rclcpp::Time& stamp)
   {
       visualization_msgs::msg::MarkerArray arr;
-      std::shared_lock lock(ivox.map_mtx_); // safe map access
+    //   std::shared_lock lock(ivox.map_mtx_); // safe map access
 
       std::unordered_map<gauss_ivox_mapping::UnionFindNode*, std::vector<Eigen::Vector3i>> clusters;
 
@@ -418,11 +428,8 @@ private:
       // m.scale.y = plane_size * sqrt(g.cov(1,1)); // spread along y-axis
       // m.scale.z = sqrt(g.cov(2,2)); // spread along z-axis
 
-      // Eigen::SelfAdjointEigenSolver<gauss_ivox_mapping::Mat3> es(g.plane_cov);
-      // double uncertainty_param = es.eigenvalues().maxCoeff();
-      // std::cout << "Plane Param Uncertainty: " << uncertainty_param << std::endl;
-
-      double uncertainty = g.residual_var; // Use the residual variance as an uncertainty proxy
+      Eigen::SelfAdjointEigenSolver<gauss_ivox_mapping::Mat3> es(g.plane_cov);
+      double uncertainty = sqrt(es.eigenvalues().maxCoeff());
 
       double u_log = std::log10(uncertainty + 1e-12);
 
@@ -519,7 +526,7 @@ private:
       double voxel_size)
   {
       visualization_msgs::msg::MarkerArray arr;
-      std::shared_lock lock(ivox.map_mtx_); // safe map access
+    //   std::shared_lock lock(ivox.map_mtx_); // safe map access
 
       std::mt19937 gen(12345); // fixed seed for consistent cluster colors
       std::uniform_real_distribution<float> dis(0.0f, 1.0f);

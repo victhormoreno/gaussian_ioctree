@@ -30,7 +30,7 @@
 
 #include <Eigen/Dense>
 // #include "gaussian_octree/gauss_ivox_deprecated.hpp"
-#include "gaussian_octree/gauss_ivox.hpp"
+#include "gaussian_octree/gauss_ivox_v0.hpp"
 
 using namespace std::chrono_literals;
 
