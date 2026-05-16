@@ -5,11 +5,14 @@
 #include <atomic>
 #include <shared_mutex>
 #include <vector>
+#include <unordered_set>
+
+#include "gaussian_octree/profiler.hpp"
 
 // Include Bonxai headers (assuming they are in your include path)
 #include "bonxai/bonxai.hpp"
 
-namespace gauss_mapping {
+namespace gauss_ivox_mapping {
 
 using Scalar = double;
 using Point  = Eigen::Matrix<Scalar, 3, 1>;
@@ -219,33 +222,40 @@ public:
           planarity_threshold_(planarity_thresh), 
           chi_square_threshold_(chi_square_thresh), 
           noise_(sensor_noise),
-          grid_(v_sz) // Initialize Bonxai Grid
+          map_(v_sz) // Initialize Bonxai Grid
     {}
 
     /**
      * @brief Update using Bonxai Accessor for O(1) cached lookup
      */
     void update(const pointWithCov& point_cov) {
+
+        PROFILE_FUNCTION(profiler_);
+
         auto& p = point_cov.p;
-        auto coord = grid_.posToCoord(p.x(), p.y(), p.z());
+        auto coord = map_.posToCoord(p.x(), p.y(), p.z());
 
         UnionFindNode* node = nullptr;
         {
-            // Lock striping or a shared_mutex is still needed for multi-threaded insertion
-            std::unique_lock<std::shared_mutex> lock(map_mtx_);
-            auto accessor = grid_.createAccessor();
+            PROFILE_SCOPE(profiler_, "Map Access");
+
+            auto accessor = map_.createAccessor();
             
             // getCell returns DataT*, we store unique_ptr to UnionFindNode
-            auto cell_ptr = accessor.value(coord, true); 
+            auto cell_ptr = accessor.value(coord, /*create_if_missing=*/true); 
             
             if (!(*cell_ptr)) {
-                Point center = grid_.coordToPos(coord).toEigen(); // Assuming toEigen() helper
+                Point center = Bonxai::ConvertPoint<Point>(map_.coordToPos(coord));
                 *cell_ptr = std::make_unique<UnionFindNode>(center);
             }
             node = cell_ptr->get();
         }
 
-        UnionFindNode* root = node->find();
+        UnionFindNode* root = nullptr;
+        {
+            PROFILE_SCOPE(profiler_, "Union Find");
+            root = node->find();
+        } 
 
         if (root->buffer_full) {
             checkNeighbors(root, coord);
@@ -262,10 +272,250 @@ public:
         }
     }
 
+    /**
+     * @brief Updates the map with new points
+     * @param points Points to insert into the map (world-frame coordinates)
+     */
+    void update(const std::vector<pointWithCov>& points) {
+        PROFILE_SCOPE(profiler_, "Batch Update");
+        for (const auto& point_cov : points) {
+            update(point_cov);
+        }
+    }
+
+    /**
+     * @brief Clears the map and resets all data
+     */
+    void clear() {
+        map_.clear(Bonxai::ClearOption::CLEAR_MEMORY);
+        total_points_ = 0;
+    }
+
+    /**
+     * @brief Returns the total number of points inserted into the map
+     * @return Total number of points
+     */
+    size_t getTotalPoints() const {
+        return total_points_.load();
+    }
+
+    /**
+     * @brief Returns the total number of voxels
+     * @return Total number of voxels
+     */
+    size_t size() const {
+        return map_.activeCellsCount();
+    }
+
+    /**
+     * @brief Returns the memory usage (Bonxai provides this directly)
+     * @return memory usage in bytes 
+     */
+    size_t memory() const {
+        return map_.memUsage();
+    }
+
+    /**
+     * @brief Returns the voxel resolution
+     * @return Voxel resolution
+     */
+    Scalar getVoxelResolution() const {
+        return v_size_;
+    }
+
+    const Bonxai::VoxelGrid<std::unique_ptr<UnionFindNode>>& getRawGrid() const { return map_; }
+
+    /**
+     * @brief Retrieves the Gaussian primitive at a given point location
+     * @param p Query point in world coordinates
+     * @return Shared pointer to the root Gaussian primitive, or nullptr if not found
+     */
+    GaussPtr getPrimitiveAtPoint(const Point& p) const
+    {
+        auto coord = map_.posToCoord(p.x(), p.y(), p.z());
+        auto accessor = map_.createConstAccessor();
+        
+        if (auto* cell_ptr = accessor.value(coord)) {
+            if (*cell_ptr) {
+                UnionFindNode* root = (*cell_ptr)->find();
+                return root->gauss_ptr;
+            }
+        }
+        return nullptr;
+    }
+
+    /**
+     * @brief Retrieves neighboring Gaussian primitives around a query point
+     * @param p Query point in world coordinates
+     * @param radius Neighborhood radius in voxel units
+     * @return Vector of neighboring Gaussian primitives (uniquified)
+    */
+    std::vector<GaussPtr> getNeighborPrimitives(const Point& p, int radius = 1) const
+    {
+        std::vector<GaussPtr> neighbors;
+        auto center_coord = map_.posToCoord(p.x(), p.y(), p.z());
+        auto accessor = map_.createConstAccessor();
+
+        // Using a set to ensure we return unique primitives even if 
+        // multiple neighboring voxels point to the same root due to DSU merging
+        std::unordered_set<UnionFindNode*> visited_roots;
+
+        for (int dx = -radius; dx <= radius; ++dx)
+        {
+            for (int dy = -radius; dy <= radius; ++dy)
+            {
+                for (int dz = -radius; dz <= radius; ++dz)
+                {
+                    Bonxai::CoordT neighbor_coord = {
+                        center_coord.x + dx, 
+                        center_coord.y + dy, 
+                        center_coord.z + dz
+                    };
+
+                    if (auto* cell_ptr = accessor.value(neighbor_coord)) {
+                        if (*cell_ptr) {
+                            UnionFindNode* root = (*cell_ptr)->find();
+                            
+                            if (visited_roots.count(root)) continue;
+                            visited_roots.insert(root);
+
+                            GaussPtr g = root->gauss_ptr;
+                            if (g && g->count > 0) {
+                                neighbors.push_back(g);
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        return neighbors;
+    }
+
+    /**
+     * @brief Retrieves K-Nearest Neighbor primitives around a query point
+     * @param p Query point in world coordinates
+     * @param k Number of nearest neighbors to retrieve
+     * @param max_radius Maximum search radius in voxel units
+     * @return Vector of neighboring Gaussian primitives
+    */
+    std::vector<GaussPtr> getKNearestPrimitives(const Point& p, size_t k, int max_radius = 2) const
+    {
+        std::vector<std::pair<Scalar, GaussPtr>> candidates;
+        auto center_coord = map_.posToCoord(p.x(), p.y(), p.z());
+        auto accessor = map_.createConstAccessor();
+
+        std::unordered_set<UnionFindNode*> visited_roots;
+
+        // Progressive radius expansion
+        for (int radius = 1; radius <= max_radius; ++radius)
+        {
+            for (int dx = -radius; dx <= radius; ++dx)
+            {
+                for (int dy = -radius; dy <= radius; ++dy)
+                {
+                    for (int dz = -radius; dz <= radius; ++dz)
+                    {
+                        // Check shell boundary for true progressive growth
+                        if (std::abs(dx) != radius && std::abs(dy) != radius && std::abs(dz) != radius)
+                            continue;
+
+                        Bonxai::CoordT neighbor_coord = {
+                            center_coord.x + dx, 
+                            center_coord.y + dy, 
+                            center_coord.z + dz
+                        };
+
+                        if (auto* cell_ptr = accessor.value(neighbor_coord)) {
+                            if (*cell_ptr) {
+                                UnionFindNode* root = (*cell_ptr)->find();
+
+                                if (visited_roots.count(root)) continue;
+                                visited_roots.insert(root);
+
+                                GaussPtr g = root->gauss_ptr;
+                                if (g && g->count > 0) {
+                                    Scalar dist = (g->mean - p).squaredNorm();
+                                    candidates.emplace_back(dist, g);
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+
+            if (candidates.size() >= k) break;
+        }
+
+        std::sort(candidates.begin(), candidates.end(), 
+            [](const auto& a, const auto& b) { return a.first < b.first; });
+
+        std::vector<GaussPtr> result;
+        size_t n = std::min(k, candidates.size());
+        result.reserve(n);
+
+        for (size_t i = 0; i < n; ++i) {
+            result.push_back(candidates[i].second);
+        }
+
+        return result;
+    }
+
+    /**
+     * @brief Thread-safe retrieval of all unique root Gaussian primitives
+     * @return Vector of shared pointers to all root Gaussians in the map
+     */
+    std::vector<GaussPtr> getGaussians() const 
+    {
+        std::vector<GaussPtr> result;
+        std::unordered_set<UnionFindNode*> visited_roots;
+
+        // Bonxai allows grid cell iterations using functional callbacks
+        map_.forEachCell([&result, &visited_roots](const std::unique_ptr<UnionFindNode>& cell, const Bonxai::CoordT&) {
+            if (cell) {
+                UnionFindNode* root = cell->find();
+                // Check if this root has already been collected from another voxel link
+                if (visited_roots.count(root) == 0) {
+                    visited_roots.insert(root);
+                    if (root->gauss_ptr && root->gauss_ptr->count > 0) {
+                        result.push_back(root->gauss_ptr);
+                    }
+                }
+            }
+        });
+
+        return result;
+    }
+
+    /**
+     * @brief Thread-safe retrieval of Gaussians filtered by primitive type
+     * @param type Primitive type to filter (PLANE, VOLUME, etc.)
+     * @return Vector of shared pointers to Gaussians of the specified type
+     */
+    std::vector<GaussPtr> getByType(PrimitiveType type) const 
+    {
+        std::vector<GaussPtr> result;
+        std::unordered_set<UnionFindNode*> visited_roots;
+
+        map_.forEachCell([&result, &visited_roots, type](const std::unique_ptr<UnionFindNode>& cell, const Bonxai::CoordT&) {
+            if (cell) {
+                UnionFindNode* root = cell->find();
+                if (visited_roots.count(root) == 0) {
+                    visited_roots.insert(root);
+                    const auto& g = root->gauss_ptr;
+                    if (g && g->type == type && g->count > 0) {
+                        result.push_back(g);
+                    }
+                }
+            }
+        });
+
+        return result;
+    }
+
     // --- Search Logic using Bonxai bit-offsets ---
     void checkNeighbors(UnionFindNode* root, const Bonxai::CoordT& coord) {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        auto accessor = grid_.createConstAccessor();
+        auto accessor = map_.createConstAccessor();
 
         // Check 6-neighbors
         static const int offsets[6][3] = {{1,0,0}, {-1,0,0}, {0,1,0}, {0,-1,0}, {0,0,1}, {0,0,-1}};
@@ -431,11 +681,6 @@ public:
         }
     }
 
-    size_t size() const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
-        return grid_.activeCellsCount();
-    }
-
     /**
      * @brief Solves plane parameters using adjugate method, selects stable axis form
      * @param node Union-find node containing point statistics
@@ -575,7 +820,8 @@ public:
         return true;
     }
 
-private:
+// private:
+
     Scalar v_size_;
     std::size_t update_threshold_;
     std::size_t max_buffer_size_;
@@ -584,9 +830,10 @@ private:
     Scalar noise_;
     std::atomic<size_t> total_points_{0};
 
-    mutable std::shared_mutex map_mtx_;
     // We store a unique_ptr to the Node inside Bonxai
-    Bonxai::VoxelGrid<std::unique_ptr<UnionFindNode>> grid_;
+    Bonxai::VoxelGrid<std::unique_ptr<UnionFindNode>> map_;
+
+    Profiler profiler_{"GAUSSIAN_IVOX"};
 };
 
-} // namespace gauss_mapping
+} // namespace gauss_ivox_mapping

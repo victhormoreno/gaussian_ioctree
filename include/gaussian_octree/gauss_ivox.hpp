@@ -288,8 +288,6 @@ public:
             //     node = it->second;
             // }
 
-            std::unique_lock<std::shared_mutex> lock(map_mtx_);
-
             auto [it, inserted] = map_.try_emplace(
                 key,
                 new UnionFindNode(voxel_center)
@@ -330,10 +328,6 @@ public:
         for (const auto& point_cov : points) {
             update(point_cov);
         }
-        std::cout << "map size: " << map_.size()
-          << " bucket count: " << map_.bucket_count()
-          << " load factor: " << map_.load_factor()
-          << std::endl;
     }
 
     /**
@@ -344,8 +338,6 @@ public:
     GaussPtr getPrimitiveAtPoint(const Point& p) const
     {
         Eigen::Vector3i key = (p * inv_v_size_).array().floor().cast<int>();
-
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
 
         auto it = map_.find(key);
         if (it == map_.end())
@@ -370,8 +362,6 @@ public:
 
         Eigen::Vector3i center_key =
             (p * inv_v_size_).array().floor().cast<int>();
-
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
 
         // Reserve approximate neighborhood size
         int side = 2 * radius + 1;
@@ -433,8 +423,6 @@ public:
 
         Eigen::Vector3i center_key =
             (p * inv_v_size_).array().floor().cast<int>();
-
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
 
         std::unordered_set<UnionFindNode*> visited_roots;
 
@@ -521,7 +509,6 @@ public:
      * @return Vector of shared pointers to all root Gaussians in the map
      */
     std::vector<GaussPtr> getGaussians() const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
         std::vector<GaussPtr> result;
         for (auto const& [_, node] : map_) {
             if (node->rootNode != node) continue; // only roots
@@ -536,7 +523,6 @@ public:
      * @return Vector of shared pointers to Gaussians of the specified type
      */
     std::vector<GaussPtr> getByType(PrimitiveType type) const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
         std::vector<GaussPtr> result;
         for (const auto& [_, node] : map_) {
             if (node->rootNode != node) continue; // only roots
@@ -554,7 +540,6 @@ public:
      * @brief Clears the map and resets all data
      */
     void clear() {
-        std::unique_lock<std::shared_mutex> lock(map_mtx_);
         for (auto& pair : map_) {
             delete pair.second;
         }
@@ -575,7 +560,6 @@ public:
      * @return Total number of voxels
      */
     size_t size() const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
         return map_.size();
     }
 
@@ -587,13 +571,16 @@ public:
         return v_size_;
     }
 
+    size_t memory() const {
+        return 0; // Placeholder, not implemented
+    }
+
     /**
      * @brief Apply a function to each voxel in a thread-safe manner
      * @param f Function to apply, taking (key, node) as arguments
      */
     template<typename Func>
     void forEachVoxel(Func&& f) const {
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
         for (const auto& [key, node] : map_) {
             f(key, node);
         }
@@ -662,7 +649,6 @@ public:
     void checkNeighbors(UnionFindNode* root, const Eigen::Vector3i& key) {
         PROFILE_FUNCTION(profiler_);
         // 6-Neighbor Search for Merging (DSU)
-        std::shared_lock<std::shared_mutex> lock(map_mtx_);
         int offsets[6][3] = {{-1,0,0}, {1,0,0}, {0,-1,0}, {0,1,0}, {0,0,1}, {0,0,-1}};
 
         for (auto& off : offsets) {
@@ -913,7 +899,6 @@ public:
         return true;
     }
 
-    mutable std::shared_mutex map_mtx_;
     std::unordered_map<Eigen::Vector3i, UnionFindNode*, HashVec3i> map_;
     Scalar v_size_, inv_v_size_;
     std::size_t update_threshold_;

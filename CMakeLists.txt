@@ -175,6 +175,29 @@ target_link_libraries(real_time_test_ivox
 )
 
 # -----------------------
+# Test executable: real time incremental mapping test with ivox bonxai
+# -----------------------
+add_executable(real_time_test_ivox_bonxai src/real_time_test_ivox_bonxai.cpp)
+
+ament_target_dependencies(real_time_test_ivox_bonxai
+  rclcpp
+  sensor_msgs
+  visualization_msgs
+  pcl_conversions
+  pcl_ros
+)
+
+target_include_directories(real_time_test_ivox_bonxai PRIVATE
+  ${PCL_INCLUDE_DIRS}
+)
+
+# Link libraries 
+target_link_libraries(real_time_test_ivox_bonxai
+  ${PROJECT_NAME}
+  ${PCL_LIBRARIES}
+)
+
+# -----------------------
 # Test executable: real time incremental mapping test with ivox octree
 # -----------------------
 add_executable(real_time_test_ivox_octree src/real_time_test_ivox_octree.cpp)
@@ -250,6 +273,12 @@ install(DIRECTORY include/
   DESTINATION include
 )
 
+# Install launch files.
+install(DIRECTORY
+  launch
+  DESTINATION share/${PROJECT_NAME}/
+)
+
 install(TARGETS
   ${PROJECT_NAME}
   static_load_test
@@ -257,6 +286,7 @@ install(TARGETS
   static_load_test_ivox
   real_time_test
   real_time_test_ivox
+  real_time_test_ivox_bonxai
   real_time_test_ivox_octree
   incremental_mapping_test
   real_time_test_unionfind
