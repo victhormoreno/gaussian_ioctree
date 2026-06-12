@@ -14,11 +14,18 @@ endif()
 
 find_package(Eigen3 REQUIRED)
 
+find_package( PCL 1.12 REQUIRED )
+add_definitions(${PCL_DEFINITIONS})
+link_directories(${PCL_LIBRARY_DIRS})
+
+message("PCL version: ${PCL_VERSION}")
+
 # Use absolute paths relative to this CMake list to point exactly to your source include directory
 include_directories(
     ${EIGEN3_INCLUDE_DIRS}
+    ${PCL_INLCUDE_DIRS}
     ${CMAKE_CURRENT_SOURCE_DIR}/../include
 )
 
 add_executable(run_map_benchmark main.cpp)
-target_link_libraries(run_map_benchmark Eigen3::Eigen)
+target_link_libraries(run_map_benchmark Eigen3::Eigen ${PCL_LIBRARIES})

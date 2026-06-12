@@ -13,6 +13,7 @@
 #include <atomic>
 #include <fstream>
 #include <unistd.h>
+#include <ctime>
 
 class Profiler
 {
@@ -28,9 +29,18 @@ public:
 
 public:
 
-    explicit Profiler(std::string name = "PROFILER")
+    explicit Profiler(
+        std::string name = "PROFILER",
+        std::string output_file = "")
         : name_(std::move(name))
     {
+        output_file_ =
+            output_file.empty()
+                ? make_default_filename()
+                : std::move(output_file);
+
+        create_log_file();
+
         start_system_monitor();
     }
 
@@ -137,6 +147,8 @@ private:
                 update_ram();
                 update_cpu();
 
+                log_system_stats();
+
                 std::this_thread::sleep_for(
                     std::chrono::milliseconds(500));
             }
@@ -222,6 +234,53 @@ private:
         last_sys_time_  = sys_time;
     }
 
+    static std::string make_default_filename()
+    {
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+
+        std::tm tm;
+        localtime_r(&t, &tm);
+
+        std::ostringstream oss;
+
+        oss << "/tmp/ivox_benchmark_"
+            << std::put_time(&tm, "%Y%m%d_%H%M%S")
+            << ".txt";
+
+        return oss.str();
+    }
+
+    void create_log_file()
+    {
+        std::ofstream out(output_file_, std::ios::out);
+
+        out << "timestamp,cpu_percent,ram_mb\n";
+    }
+
+    void log_system_stats()
+    {
+        std::lock_guard<std::mutex> lock(file_mtx_);
+
+        std::ofstream out(output_file_, std::ios::app);
+
+        if (!out)
+            return;
+
+        auto now = std::chrono::system_clock::now();
+        std::time_t t = std::chrono::system_clock::to_time_t(now);
+
+        std::tm tm;
+        localtime_r(&t, &tm);
+
+        out << std::put_time(&tm, "%Y-%m-%d %H:%M:%S")
+            << ","
+            << cpu_percent_.load()
+            << ","
+            << ram_mb_.load()
+            << "\n";
+    }
+
 private:
 
     mutable std::mutex mtx_;
@@ -238,6 +297,9 @@ private:
     long last_proc_time_ = 0;
     long last_sys_time_  = 0;
     int num_cores_ = 1;
+
+    std::string output_file_;
+    mutable std::mutex file_mtx_;
 };
 
 //////////////////////////////////////////////////////////////////

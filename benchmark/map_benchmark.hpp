@@ -10,6 +10,9 @@
 #include <iomanip>
 #include <unistd.h>
 
+#include <pcl/io/pcd_io.h>
+#include <pcl/point_types.h>
+
 #include "gaussian_octree/gauss_bonxai_ivox.hpp"
 // #include "gaussian_octree/gauss_ivox.hpp"
 
@@ -75,42 +78,34 @@ inline size_t getProcessRSS_KB() {
 
 } // namespace benchmark
 
-// Optional PCD parsing manually to avoid heavy external PCL build dependencies if desired, 
-// but here customized to fit standard ASCII/Binary PCD patterns directly.
-inline std::vector<gauss_ivox_mapping::pointWithCov> loadPointsFromPCD(const std::string& path) {
+inline std::vector<gauss_ivox_mapping::pointWithCov> loadPointsFromPCD(const std::string& path)
+{
     std::vector<gauss_ivox_mapping::pointWithCov> points;
-    std::ifstream file(path);
-    if (!file.is_open()) {
-        std::cerr << "[Error] Could not open PCD file: " << path << std::endl;
+
+    // PCL point cloud (XYZ)
+    pcl::PointCloud<pcl::PointXYZ>::Ptr cloud(
+        new pcl::PointCloud<pcl::PointXYZ>);
+
+    if (pcl::io::loadPCDFile<pcl::PointXYZ>(path, *cloud) == -1)
+    {
+        std::cerr << "[Error] Could not load PCD file: "
+                  << path << std::endl;
         return points;
     }
 
-    std::string line;
-    size_t num_points = 0;
-    bool data_section = false;
+    points.reserve(cloud->size());
 
-    while (std::getline(file, line)) {
-        if (!data_section) {
-            if (line.rfind("POINTS", 0) == 0) {
-                num_points = std::stoull(line.substr(7));
-            }
-            if (line.rfind("DATA", 0) == 0) {
-                data_section = true;
-                points.reserve(num_points);
-            }
-            continue;
-        }
-        
-        if (line.empty()) continue;
-        std::stringstream ss(line);
-        double x, y, z;
-        if (ss >> x >> y >> z) {
-            gauss_ivox_mapping::pointWithCov pt;
-            pt.p << x, y, z;
-            pt.cov = 0.001 * gauss_ivox_mapping::Mat3::Identity(); // Regularization floor noise
-            points.push_back(pt);
-        }
+    for (const auto& p : cloud->points)
+    {
+        gauss_ivox_mapping::pointWithCov pt;
+        pt.p << p.x, p.y, p.z;
+
+        // Regularization floor noise
+        pt.cov = 0.001 * gauss_ivox_mapping::Mat3::Identity();
+
+        points.push_back(pt);
     }
+
     return points;
 }
 

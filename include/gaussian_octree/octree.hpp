@@ -34,6 +34,8 @@
 #include <functional>
 #include <Eigen/Dense>
 
+#include "gaussian_octree/profiler.hpp"
+
 namespace octree {
 
 using Point  = Eigen::Vector3f;
@@ -138,6 +140,8 @@ struct Octree {
   bool downsample_;     // flag indicating if downsampling should occur under certain conditions
 
   Octant *root_;        // pointer to the root `Octant` of the tree
+
+  Profiler profiler_{"OCTREE"};
 
   // used in the kNN search to order the traversal of child octants for efficiency by checking the most promising child first
   size_t ordered_indices[8][7] = {

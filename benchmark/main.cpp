@@ -6,6 +6,12 @@
 
 #include "map_benchmark.hpp"
 
+/*
+ GAUSSIAN IVOX BENCHMARKING
+  usage:
+    $ ./run_map_benchmark --pcd /path/to/file.pcd --res 0.2 --thresh 1 --frames 500
+*/
+
 int main(int argc, char** argv) {
     std::cout << "[Setup] Starting Map Benchmarking Instance Suite..." << std::endl;
 
@@ -40,6 +46,7 @@ int main(int argc, char** argv) {
         std::cout << "[Dataset] Loading physical PCD frames from: " << pcd_path << std::endl;
         full_cloud = loadPointsFromPCD(pcd_path);
         if (full_cloud.empty()) return -1;
+        std::cout << "[Dataset] PCD file with " << full_cloud.size() << " points" << std::endl;
         points_per_frame = full_cloud.size() / TotalFrames;
         if (points_per_frame == 0) points_per_frame = full_cloud.size();
     } else {
